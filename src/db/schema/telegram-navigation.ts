@@ -67,14 +67,7 @@ export const telegramNavigationContext = pgTable(
         table.navigationToken,
       ],
     }),
-    index("telegram_navigation_context_scope_expiry_idx").on(
-      table.storeId,
-      table.connectionId,
-      table.botId,
-      table.telegramUserId,
-      table.telegramChatId,
-      table.expiresAt,
-    ),
+    index("telegram_navigation_context_expires_idx").on(table.expiresAt),
     index("telegram_navigation_context_category_idx").on(table.categoryId),
     foreignKey({
       name: "telegram_navigation_context_store_fk",

@@ -28,5 +28,5 @@ CREATE TABLE "telegram_navigation_context" (
 ALTER TABLE "telegram_navigation_context" ADD CONSTRAINT "telegram_navigation_context_store_fk" FOREIGN KEY ("store_id") REFERENCES "public"."store"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "telegram_navigation_context" ADD CONSTRAINT "telegram_navigation_context_connection_fk" FOREIGN KEY ("connection_id") REFERENCES "public"."telegram_connection"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "telegram_navigation_context" ADD CONSTRAINT "telegram_navigation_context_category_fk" FOREIGN KEY ("category_id") REFERENCES "public"."category"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
-CREATE INDEX "telegram_navigation_context_scope_expiry_idx" ON "telegram_navigation_context" USING btree ("store_id","connection_id","bot_id","telegram_user_id","telegram_chat_id","expires_at");--> statement-breakpoint
+CREATE INDEX "telegram_navigation_context_expires_idx" ON "telegram_navigation_context" USING btree ("expires_at");--> statement-breakpoint
 CREATE INDEX "telegram_navigation_context_category_idx" ON "telegram_navigation_context" USING btree ("category_id");

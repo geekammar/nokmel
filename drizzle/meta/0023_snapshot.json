@@ -1,5 +1,5 @@
 {
-  "id": "428b8c64-a4b9-4e0f-9cdc-53af4836dfee",
+  "id": "d7179cae-e20f-4e48-9856-16e3366beb9a",
   "prevId": "63b14906-60df-433d-98d5-980f0351af37",
   "version": "7",
   "dialect": "postgresql",
@@ -4646,39 +4646,9 @@
         }
       },
       "indexes": {
-        "telegram_navigation_context_scope_expiry_idx": {
-          "name": "telegram_navigation_context_scope_expiry_idx",
+        "telegram_navigation_context_expires_idx": {
+          "name": "telegram_navigation_context_expires_idx",
           "columns": [
-            {
-              "expression": "store_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "connection_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "bot_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "telegram_user_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "telegram_chat_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
             {
               "expression": "expires_at",
               "isExpression": false,

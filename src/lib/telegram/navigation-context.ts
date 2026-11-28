@@ -1,7 +1,7 @@
 import "server-only";
 
 import crypto from "node:crypto";
-import { and, eq, lte } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 
 import type { Database } from "@/db/client";
 import {
@@ -46,6 +46,7 @@ export type NavigationLookup =
 
 export const NAVIGATION_CONTEXT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 export const NAVIGATION_TOKEN_BYTES = 9;
+export const NAVIGATION_CONTEXT_PRUNE_BATCH_SIZE = 25;
 const SEARCH_QUERY_LIMIT = 80;
 
 function newNavigationToken(): string {
@@ -113,9 +114,45 @@ function destinationColumns(destination: NavigationDestination): {
 }
 
 /**
+ * Bounded, indexed cleanup of expired navigation rows.
+ *
+ * Normal storefront traffic triggers this before a new context is written.
+ * The delete is capped at {@link NAVIGATION_CONTEXT_PRUNE_BATCH_SIZE} rows per
+ * call and walks the dedicated `expires_at` index, so it never performs an
+ * unbounded scan or delete inside a Telegram handler. Rows belonging to a buyer
+ * who never returns are therefore still eligible on the next context write by
+ * any storefront visitor.
+ *
+ * Expiry is enforced by `readNavigationContext` independently of cleanup. If
+ * traffic stops, expired rows can remain physically present, but they can
+ * never resolve a callback; cleanup resumes on the next normal context write.
+ * A failed prune is maintenance noise and must not block the current screen or
+ * its context write.
+ */
+export async function pruneExpiredNavigationContexts(
+  db: Database,
+  now = new Date(),
+): Promise<void> {
+  try {
+    await db.execute(sql`
+      DELETE FROM ${telegramNavigationContext}
+      WHERE ctid IN (
+        SELECT ctid
+        FROM ${telegramNavigationContext}
+        WHERE expires_at <= ${now.toISOString()}::timestamptz
+        ORDER BY expires_at
+        LIMIT ${NAVIGATION_CONTEXT_PRUNE_BATCH_SIZE}
+      )
+    `);
+  } catch {
+    // Cleanup is best effort; reads still reject expired rows by timestamp.
+  }
+}
+
+/**
  * Persists the origin before the screen is rendered and returns the opaque
- * token placed on its product buttons. Expired rows for the same buyer scope
- * are removed first so a long-lived chat does not accumulate rows forever.
+ * token placed on its product buttons. A normal successful render triggers the
+ * bounded global cleanup described above before inserting the new row.
  */
 export async function rememberNavigationContext(
   db: Database,
@@ -126,18 +163,7 @@ export async function rememberNavigationContext(
   const now = new Date();
   const expiresAt = new Date(now.getTime() + NAVIGATION_CONTEXT_TTL_MS);
 
-  await db
-    .delete(telegramNavigationContext)
-    .where(
-      and(
-        eq(telegramNavigationContext.storeId, binding.storeId),
-        eq(telegramNavigationContext.connectionId, binding.connectionId),
-        eq(telegramNavigationContext.botId, binding.botId),
-        eq(telegramNavigationContext.telegramUserId, binding.telegramUserId),
-        eq(telegramNavigationContext.telegramChatId, binding.telegramChatId),
-        lte(telegramNavigationContext.expiresAt, now),
-      ),
-    );
+  await pruneExpiredNavigationContexts(db, now);
 
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const navigationToken = newNavigationToken();

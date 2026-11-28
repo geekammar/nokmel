@@ -83,6 +83,8 @@ import {
   readNavigationContext,
   rememberNavigationContext,
   type NavigationBinding,
+  type NavigationDestination,
+  type NavigationLookup,
 } from "./navigation-context";
 import {
   isNavigationToken,
@@ -1061,6 +1063,52 @@ async function editOnlyOrThrow(
   }
 }
 
+function logNavigationContextFailure(
+  operation: "read" | "write",
+  error: unknown,
+): void {
+  const diagnostic = classifyErrorToSafeDiagnostic(error);
+  console.error(
+    `[storefront] navigation context ${operation} skipped (${formatSafeDiagnostic(diagnostic)})`,
+  );
+}
+
+/**
+ * Navigation context is optional. A failure to persist it must never hide a
+ * catalog screen that was already read successfully; the screen simply renders
+ * context-free product buttons and direct-entry Back behaviour remains.
+ */
+async function rememberNavigationToken(
+  db: Database,
+  binding: NavigationBinding,
+  destination: NavigationDestination,
+): Promise<string | undefined> {
+  try {
+    return await rememberNavigationContext(db, binding, destination);
+  } catch (error) {
+    logNavigationContextFailure("write", error);
+    return undefined;
+  }
+}
+
+/**
+ * A failed context read is treated like an unusable context. The caller falls
+ * through to the existing safe, localized, store-scoped destination instead of
+ * failing the callback.
+ */
+async function readNavigationLookup(
+  db: Database,
+  binding: NavigationBinding,
+  navigationToken: string,
+): Promise<NavigationLookup | null> {
+  try {
+    return await readNavigationContext(db, binding, navigationToken);
+  } catch (error) {
+    logNavigationContextFailure("read", error);
+    return null;
+  }
+}
+
 function productButton(
   item: { id: string; name: string },
   navigationToken?: string,
@@ -1149,7 +1197,7 @@ async function renderHome(
   ]);
   const navigationToken =
     navigation && page.items.length > 0
-      ? await rememberNavigationContext(db, navigation, { route: "home" })
+      ? await rememberNavigationToken(db, navigation, { route: "home" })
       : undefined;
 
   const keyboard: TelegramInlineKeyboardButton[][] = [
@@ -1245,7 +1293,7 @@ async function renderProducts(
   );
   const navigationToken =
     navigation && page.items.length > 0
-      ? await rememberNavigationContext(db, navigation, {
+      ? await rememberNavigationToken(db, navigation, {
           route: "products",
           page: page.page,
         })
@@ -1318,7 +1366,7 @@ async function renderCatalogSearch(
   );
   const navigationToken =
     navigation && page.items.length > 0
-      ? await rememberNavigationContext(db, navigation, {
+      ? await rememberNavigationToken(db, navigation, {
           route: "search",
           query,
           page: page.page,
@@ -1462,7 +1510,7 @@ async function renderCategory(
 
   const navigationToken =
     navigation && products.items.length > 0
-      ? await rememberNavigationContext(db, navigation, {
+      ? await rememberNavigationToken(db, navigation, {
           route: "category",
           categoryId,
           page: products.page,
@@ -1742,7 +1790,25 @@ async function renderProductBack(
   );
 
   if (navigationToken) {
-    const lookup = await readNavigationContext(db, navigation, navigationToken);
+    const lookup = await readNavigationLookup(db, navigation, navigationToken);
+
+    if (!lookup) {
+      await renderHome(
+        db,
+        scope,
+        storeName,
+        cod,
+        copy,
+        plan,
+        transport,
+        chatId,
+        messageId,
+        recovery,
+        activeMessageHasMedia,
+        navigation,
+      );
+      return;
+    }
 
     if (lookup.status === "found") {
       const destination = lookup.destination;

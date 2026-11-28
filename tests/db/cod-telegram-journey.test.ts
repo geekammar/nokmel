@@ -23,6 +23,7 @@ import {
   telegramConnection,
   telegramNavigationContext,
 } from "@/db/schema";
+import type { Database } from "@/db/client";
 import type { TransactionDatabase } from "@/db/transaction-client";
 import type { MerchantAccess } from "@/lib/auth/merchant-session";
 import { saveStorefrontProfile } from "@/lib/merchant/storefront-profile";
@@ -35,6 +36,9 @@ import {
 import { saveMerchantStoreLanguage } from "@/lib/merchant/store-language";
 import { hashWebhookSecret } from "@/lib/telegram/connection-secrets";
 import { handleManagedTelegramWebhookRequest } from "@/lib/telegram/managed-webhook";
+import {
+  NAVIGATION_CONTEXT_PRUNE_BATCH_SIZE,
+} from "@/lib/telegram/navigation-context";
 import { tokens } from "@/lib/telegram/tokens";
 import {
   createFakeTelegramTransport,
@@ -104,6 +108,7 @@ let updateId = 5000;
 type Fixture = {
   storeAId: string;
   storeBId: string;
+  storeCId: string;
   categoryAId: string;
   categoryBId: string;
   productAId: string;
@@ -364,6 +369,7 @@ beforeAll(async () => {
   fixture = {
     storeAId: storeA.id,
     storeBId: storeB.id,
+    storeCId: storeC.id,
     categoryAId: categoryA.id,
     categoryBId: categoryB.id,
     productAId: productA.id,
@@ -542,18 +548,96 @@ async function call(
   body: unknown,
   secret = "bot-secret-a",
   transport: FakeTelegramTransport = createFakeTelegramTransport(),
+  options?: { db?: Database },
 ): Promise<{ status: number; transport: FakeTelegramTransport }> {
   const response = await handleManagedTelegramWebhookRequest(
     webhookRequest(body, secret),
     connectionId,
     {
-      db: asAppDb(db()),
+      db: options?.db ?? asAppDb(db()),
       commerceDb: db() as unknown as TransactionDatabase,
       transport,
     },
   );
 
   return { status: response.status, transport };
+}
+
+/**
+ * Fails only navigation-context writes. Catalog reads, update claiming and all
+ * other tables keep working, so the surrounding storefront screen can prove it
+ * renders without an optional token.
+ */
+function navigationWriteFailingDb(): Database {
+  const real = asAppDb(db());
+
+  return new Proxy(real, {
+    get(target, property, receiver) {
+      if (property === "insert" || property === "delete") {
+        return (table: unknown) => {
+          if (table === telegramNavigationContext) {
+            throw new Error("navigation context write failed");
+          }
+          const method = Reflect.get(target, property) as (
+            value: unknown,
+          ) => unknown;
+          return method.call(target, table);
+        };
+      }
+
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  }) as Database;
+}
+
+/**
+ * Fails only a select whose source is the navigation-context table. The
+ * language, catalog, cart and order reads used by the fallback still work.
+ */
+function navigationReadFailingDb(): Database {
+  const real = asAppDb(db());
+
+  return new Proxy(real, {
+    get(target, property, receiver) {
+      if (property === "select") {
+        return (...args: unknown[]) => {
+          const select = Reflect.get(target, property) as (
+            ...values: unknown[]
+          ) => object;
+          const query = select.apply(target, args);
+
+          return new Proxy(query, {
+            get(queryTarget, queryProperty, queryReceiver) {
+              if (queryProperty === "from") {
+                return (table: unknown) => {
+                  if (table === telegramNavigationContext) {
+                    throw new Error("navigation context read failed");
+                  }
+                  const from = Reflect.get(queryTarget, queryProperty) as (
+                    value: unknown,
+                  ) => unknown;
+                  return from.call(queryTarget, table);
+                };
+              }
+
+              const value = Reflect.get(
+                queryTarget,
+                queryProperty,
+                queryReceiver,
+              );
+              return typeof value === "function"
+                ? value.bind(queryTarget)
+                : value;
+            },
+          });
+        };
+      }
+
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  }) as Database;
 }
 
 function inlineButtons(message: {
@@ -2326,11 +2410,16 @@ describe.skipIf(!shouldRun)("COD managed Telegram journey", () => {
   });
 
   describe("managed catalog navigation context", () => {
-    async function sendNavigationSearch(query: string) {
+    async function sendNavigationSearch(
+      query: string,
+      dbOverride?: Database,
+    ) {
       const search = await call(
         fixture.connectionCId,
         callbackUpdate(BUYER_C, "catalog-search", "en"),
         "bot-secret-c",
+        createFakeTelegramTransport(),
+        { db: dbOverride },
       );
       const prompt = search.transport.sentMessages.at(-1)!;
       const reply = {
@@ -2348,6 +2437,8 @@ describe.skipIf(!shouldRun)("COD managed Telegram journey", () => {
           "en",
         ),
         "bot-secret-c",
+        createFakeTelegramTransport(),
+        { db: dbOverride },
       );
       expect(result.status).toBe(200);
       return result.transport.sentMessages.at(-1)!;
@@ -2390,6 +2481,7 @@ describe.skipIf(!shouldRun)("COD managed Telegram journey", () => {
         connectionId?: string;
         secret?: string;
         languageCode?: string;
+        db?: Database;
       },
     ): Promise<FakeTelegramTransport> {
       const result = await call(
@@ -2401,6 +2493,8 @@ describe.skipIf(!shouldRun)("COD managed Telegram journey", () => {
           messageId,
         ),
         options?.secret ?? "bot-secret-c",
+        createFakeTelegramTransport(),
+        { db: options?.db },
       );
       expect(result.status).toBe(200);
       return result.transport;
@@ -2720,6 +2814,160 @@ describe.skipIf(!shouldRun)("COD managed Telegram journey", () => {
       const invalidBack = tokens.productBack(productId, "AAAAAAAAAAAA");
       const invalid = await clickNavigation(invalidBack, 8601);
       expect(invalid.editedMessages.at(-1)!.text).toBe("Bot C Root");
+    });
+
+    it("renders all catalog screens without tokens when context storage fails", async () => {
+      const failing = navigationWriteFailingDb();
+      const firstProductId = fixture.navigationProductIds[0];
+
+      const home = await call(
+        fixture.connectionCId,
+        messageUpdate(BUYER_C, "/start", {}, "en"),
+        "bot-secret-c",
+        createFakeTelegramTransport(),
+        { db: failing },
+      );
+      expect(home.status).toBe(200);
+      const homeMessage = home.transport.sentMessages.at(-1)!;
+      expect(homeMessage.text).toContain("Welcome to Bot COD Store C.");
+      expect(buttonFor(homeMessage, "p:")?.callback_data).toBe(
+        `p:${firstProductId}`,
+      );
+
+      const products = await clickNavigation("prods", 8701, { db: failing });
+      const listPage = products.editedMessages.at(-1)!;
+      expect(listPage.text).toContain("Products (1/2)");
+      const listProduct = buttonFor(listPage, "p:");
+      expect(listProduct?.callback_data).toBe(`p:${firstProductId}`);
+
+      const category = await clickNavigation(
+        `sc:${fixture.categoryCId}`,
+        8702,
+        { db: failing },
+      );
+      const categoryPage = category.editedMessages.at(-1)!;
+      expect(categoryPage.text).toBe("Bot C Root");
+      expect(buttonFor(categoryPage, "p:")?.callback_data).toBe(
+        `p:${firstProductId}`,
+      );
+
+      const results = await sendNavigationSearch("nav item", failing);
+      expect(results.text).toContain("Product search results");
+      expect(buttonFor(results, "p:")?.callback_data).toBe(
+        `p:${firstProductId}`,
+      );
+
+      // Direct-entry Back still reaches the product's own category even while
+      // optional context storage is failing.
+      const product = await clickNavigation(
+        listProduct!.callback_data!,
+        listPage.messageId,
+        { db: failing },
+      );
+      const productCard = product.editedMessages.at(-1)!;
+      expect(productCard.text).toContain("Nav Item");
+      const backButton = buttonFor(productCard, "pb:");
+      expect(backButton?.callback_data).toBe(
+        tokens.productBack(firstProductId),
+      );
+
+      const categoryAgain = await clickNavigation(
+        backButton!.callback_data!,
+        productCard.messageId,
+        { db: failing },
+      );
+      expect(categoryAgain.editedMessages.at(-1)!.text).toBe("Bot C Root");
+    });
+
+    it("falls back to the localized home when the return context cannot be read", async () => {
+      const pageOne = await clickNavigation("prods", 8801);
+      const listPage = pageOne.editedMessages.at(-1)!;
+      const productButton = buttonFor(listPage, "p:");
+      expect(productButton?.callback_data).toBeDefined();
+
+      const product = await clickNavigation(
+        productButton!.callback_data!,
+        listPage.messageId,
+      );
+      const productCard = product.editedMessages.at(-1)!;
+      const backButton = buttonFor(productCard, "pb:");
+      expect(backButton?.callback_data).toBeDefined();
+
+      const failed = await clickNavigation(
+        backButton!.callback_data!,
+        productCard.messageId,
+        { db: navigationReadFailingDb(), languageCode: "ar" },
+      );
+      expect(failed.editedMessages.at(-1)!.text).toContain(
+        "مرحبًا بك في Bot COD Store C.",
+      );
+    });
+
+    it("prunes expired rows from another inactive buyer and keeps unexpired rows", async () => {
+      const inactiveBuyer = 91999;
+      const now = Date.now();
+      const expiredRows = Array.from(
+        { length: NAVIGATION_CONTEXT_PRUNE_BATCH_SIZE + 5 },
+        (_, index) => ({
+          storeId: fixture.storeCId,
+          connectionId: fixture.connectionCId,
+          botId: NAVIGATION_BOT_ID,
+          telegramUserId: inactiveBuyer,
+          telegramChatId: inactiveBuyer,
+          navigationToken: `E${String(index).padStart(2, "0")}${"A".repeat(9)}`,
+          route: "products",
+          page: 1,
+          expiresAt: new Date(now - 60_000 - index * 1_000),
+        }),
+      );
+      const unexpiredToken = `U${"B".repeat(11)}`;
+
+      await db().insert(telegramNavigationContext).values([
+        ...expiredRows,
+        {
+          storeId: fixture.storeCId,
+          connectionId: fixture.connectionCId,
+          botId: NAVIGATION_BOT_ID,
+          telegramUserId: inactiveBuyer,
+          telegramChatId: inactiveBuyer,
+          navigationToken: unexpiredToken,
+          route: "products",
+          page: 1,
+          expiresAt: new Date(now + 300_000),
+        },
+      ]);
+
+      const inactiveRows = () =>
+        db()
+          .select({
+            navigationToken: telegramNavigationContext.navigationToken,
+            expiresAt: telegramNavigationContext.expiresAt,
+          })
+          .from(telegramNavigationContext)
+          .where(
+            eq(telegramNavigationContext.telegramUserId, inactiveBuyer),
+          );
+
+      expect(await inactiveRows()).toHaveLength(expiredRows.length + 1);
+
+      // Normal storefront traffic from a different buyer triggers the bounded
+      // global cleanup.
+      await clickNavigation("prods", 8901);
+      const afterFirst = await inactiveRows();
+      expect(afterFirst).toHaveLength(
+        expiredRows.length + 1 - NAVIGATION_CONTEXT_PRUNE_BATCH_SIZE,
+      );
+      expect(
+        afterFirst.some((row) => row.navigationToken === unexpiredToken),
+      ).toBe(true);
+      expect(
+        afterFirst.filter((row) => row.expiresAt.getTime() <= Date.now()),
+      ).toHaveLength(expiredRows.length - NAVIGATION_CONTEXT_PRUNE_BATCH_SIZE);
+
+      await clickNavigation("prods", 8902);
+      const afterSecond = await inactiveRows();
+      expect(afterSecond).toHaveLength(1);
+      expect(afterSecond[0].navigationToken).toBe(unexpiredToken);
     });
   });
 
