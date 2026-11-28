@@ -222,14 +222,14 @@ function contactUpdate(buyerId: number, phoneNumber: string) {
   };
 }
 
-function callbackUpdate(buyerId: number, data: string) {
+function callbackUpdate(buyerId: number, data: string, messageId?: number) {
   return {
     update_id: nextUpdateId(),
     callback_query: {
       id: `callback-${nextUpdateId()}`,
       from: { id: buyerId, is_bot: false, first_name: "Buyer" },
       message: {
-        message_id: 7000 + updateId,
+        message_id: messageId ?? 7000 + updateId,
         chat: { id: buyerId, type: "private" },
         date: 1,
       },
@@ -263,7 +263,12 @@ async function call(
   return { status: response.status, transport };
 }
 
-type AnyMessage = { text?: string; caption?: string; replyMarkup?: unknown };
+type AnyMessage = {
+  messageId?: number;
+  text?: string;
+  caption?: string;
+  replyMarkup?: unknown;
+};
 
 function allMessages(transport: FakeTelegramTransport): AnyMessage[] {
   return [
@@ -420,7 +425,7 @@ describe.skipIf(!shouldRun)("Batch 01 merchant-to-buyer acceptance", () => {
 
     const confirmed = await call(
       fixture.connectionAId,
-      callbackUpdate(BUYER, confirm!.callback_data!),
+      callbackUpdate(BUYER, confirm!.callback_data!, reviewMessage.messageId),
       "batch-secret-a",
       review.transport,
     );
