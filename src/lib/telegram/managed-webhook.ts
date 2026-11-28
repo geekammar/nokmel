@@ -2,6 +2,10 @@ import "server-only";
 
 import type { Database } from "@/db/client";
 import { getDb } from "@/db/client";
+import type {
+  TelegramStorefrontInputMode,
+  TelegramStorefrontRoute,
+} from "@/db/schema";
 import {
   getTransactionDb,
   type TransactionDatabase,
@@ -23,6 +27,7 @@ import {
   confirmVodafoneCashOrder,
   readCartForBuyer,
   readLatestBuyerCodOrder,
+  readPlacedOrderForCart,
   bindVodafoneCashTransferPromptMessage,
   listBuyerOutstandingVodafoneTransfers,
   readCheckoutAvailability,
@@ -80,6 +85,17 @@ import {
   isBuyerLocale,
 } from "@/lib/commerce/buyer-language";
 import {
+  acquireStorefrontLock,
+  adoptActiveStorefront,
+  readActiveStorefront,
+  recordActiveStorefront,
+  releaseStorefrontLock,
+  setActiveStorefrontInputMode,
+  StorefrontScopeBusyError,
+  type ActiveStorefront,
+  type ActiveStorefrontBinding,
+} from "./active-storefront";
+import {
   readNavigationContext,
   rememberNavigationContext,
   type NavigationBinding,
@@ -88,8 +104,10 @@ import {
 } from "./navigation-context";
 import {
   isNavigationToken,
+  screenRevisionFromData,
   tokens,
   UUID_REGEX,
+  withScreenRevision,
   type ParsedToken,
 } from "./tokens";
 import { telegramSupportChatUrl } from "./support-contact";
@@ -126,6 +144,177 @@ import { validateIncomingUpdate } from "./webhook";
 
 const PAGE_SIZE = 8;
 const SEARCH_QUERY_LIMIT = 80;
+
+type StorefrontLifecycle = {
+  db: Database;
+  binding: ActiveStorefrontBinding;
+  updateId: number;
+  active: ActiveStorefront | null;
+  route: TelegramStorefrontRoute;
+  screenRevision: number;
+};
+
+const STOREFRONT_LIFECYCLE = Symbol("storefrontLifecycle");
+type LifecycleTransport = TelegramTransport & {
+  [STOREFRONT_LIFECYCLE]?: StorefrontLifecycle;
+};
+
+function attachStorefrontLifecycle(
+  transport: TelegramTransport,
+  lifecycle: StorefrontLifecycle,
+): TelegramTransport {
+  Object.defineProperty(transport, STOREFRONT_LIFECYCLE, {
+    value: lifecycle,
+    configurable: true,
+    enumerable: false,
+  });
+  return transport;
+}
+
+function storefrontLifecycle(
+  transport: TelegramTransport,
+): StorefrontLifecycle | undefined {
+  return (transport as LifecycleTransport)[STOREFRONT_LIFECYCLE];
+}
+
+function setStorefrontRoute(
+  transport: TelegramTransport,
+  route: TelegramStorefrontRoute,
+): void {
+  const lifecycle = storefrontLifecycle(transport);
+  if (lifecycle) lifecycle.route = route;
+}
+
+function bindScreenRevision(
+  transport: TelegramTransport,
+  replyMarkup: Parameters<TelegramTransport["sendMessage"]>[0]["replyMarkup"],
+): Parameters<TelegramTransport["sendMessage"]>[0]["replyMarkup"] {
+  const lifecycle = storefrontLifecycle(transport);
+  if (!lifecycle || !replyMarkup || !("inline_keyboard" in replyMarkup)) {
+    return replyMarkup;
+  }
+
+  return {
+    inline_keyboard: replyMarkup.inline_keyboard.map((row) =>
+      row.map((button) =>
+        button.callback_data
+          ? {
+              ...button,
+              callback_data: withScreenRevision(
+                button.callback_data,
+                lifecycle.screenRevision,
+              ),
+            }
+          : button,
+      ),
+    ),
+  };
+}
+
+function logActiveStorefrontFailure(
+  operation: "read" | "write",
+  error: unknown,
+): void {
+  const diagnostic = classifyErrorToSafeDiagnostic(error);
+  console.error(
+    `[storefront] active message ${operation} skipped (${formatSafeDiagnostic(diagnostic)})`,
+  );
+}
+
+async function readActiveStorefrontSafely(
+  db: Database,
+  binding: ActiveStorefrontBinding,
+): Promise<ActiveStorefront | null> {
+  try {
+    return await readActiveStorefront(db, binding);
+  } catch (error) {
+    logActiveStorefrontFailure("read", error);
+    return null;
+  }
+}
+
+async function readConfirmationRecoverySafely(
+  db: Database | TransactionDatabase,
+  scope: StoreScope,
+  input: {
+    cartId: string;
+    connectionId: string;
+    telegramUserId: number;
+    telegramChatId: number;
+    paymentMethod: "cod" | "vodafone_cash";
+  },
+) {
+  try {
+    return await readPlacedOrderForCart(db, scope, input);
+  } catch (error) {
+    logActiveStorefrontFailure("read", error);
+    return null;
+  }
+}
+
+async function recordActiveStorefrontSafely(
+  transport: TelegramTransport,
+  messageId: number,
+  hasMedia: boolean,
+): Promise<void> {
+  const lifecycle = storefrontLifecycle(transport);
+  if (!lifecycle) return;
+
+  try {
+    await recordActiveStorefront(lifecycle.db, lifecycle.binding, {
+      messageId,
+      hasMedia,
+      route: lifecycle.route,
+      revision: lifecycle.screenRevision,
+      updateId: lifecycle.updateId,
+    });
+  } catch (error) {
+    logActiveStorefrontFailure("write", error);
+  }
+}
+
+async function adoptActiveStorefrontSafely(
+  transport: TelegramTransport,
+  messageId: number,
+  hasMedia: boolean,
+): Promise<void> {
+  const lifecycle = storefrontLifecycle(transport);
+  if (!lifecycle) return;
+
+  try {
+    await adoptActiveStorefront(lifecycle.db, lifecycle.binding, {
+      messageId,
+      hasMedia,
+      route: lifecycle.active?.route ?? "storefront",
+      updateId: lifecycle.updateId,
+    });
+  } catch (error) {
+    logActiveStorefrontFailure("write", error);
+  }
+}
+
+async function setStorefrontInputMode(
+  transport: TelegramTransport,
+  inputMode: TelegramStorefrontInputMode,
+  promptMessageId: number | null = null,
+): Promise<void> {
+  const lifecycle = storefrontLifecycle(transport);
+  if (!lifecycle) return;
+
+  try {
+    await setActiveStorefrontInputMode(
+      lifecycle.db,
+      lifecycle.binding,
+      {
+        inputMode,
+        promptMessageId,
+        updateId: lifecycle.updateId,
+      },
+    );
+  } catch (error) {
+    logActiveStorefrontFailure("write", error);
+  }
+}
 
 function managedSearchQuery(value: string): string | null {
   const query = value.replace(/\s+/gu, " ").trim();
@@ -224,6 +413,8 @@ async function renderLanguageMenu(
   context: string | null = null,
   text = copy.languageTitle,
 ): Promise<void> {
+  setStorefrontRoute(transport, "language");
+
   const params = {
     chatId,
     text,
@@ -233,7 +424,7 @@ async function renderLanguageMenu(
   if (messageId) {
     await editOrThrow(transport, { ...params, messageId });
   } else {
-    await sendOrThrow(transport, params);
+    await sendActiveOrThrow(transport, params);
   }
 }
 
@@ -559,6 +750,8 @@ async function renderCartView(
   cart: CartView | null,
   copy: CommerceCopy,
 ): Promise<void> {
+  setStorefrontRoute(transport, "cart");
+
   if (!cart || cart.lines.length === 0) {
     const params = {
       chatId,
@@ -569,7 +762,7 @@ async function renderCartView(
     if (messageId) {
       await editOrThrow(transport, { ...params, messageId });
     } else {
-      await sendOrThrow(transport, params);
+      await sendActiveOrThrow(transport, params);
     }
     return;
   }
@@ -583,7 +776,7 @@ async function renderCartView(
   if (messageId) {
     await editOrThrow(transport, { ...params, messageId });
   } else {
-    await sendOrThrow(transport, params);
+    await sendActiveOrThrow(transport, params);
   }
 }
 
@@ -595,6 +788,8 @@ async function renderReviewView(
   copy: CommerceCopy,
   vodafoneCashEnabled = false,
 ): Promise<void> {
+  setStorefrontRoute(transport, "review");
+
   const params = {
     chatId,
     text: reviewText(review, copy, vodafoneCashEnabled),
@@ -604,7 +799,7 @@ async function renderReviewView(
   if (messageId) {
     await editOrThrow(transport, { ...params, messageId });
   } else {
-    await sendOrThrow(transport, params);
+    await sendActiveOrThrow(transport, params);
   }
 }
 
@@ -613,8 +808,8 @@ async function sendPhonePrompt(
   chatId: number,
   cart: CartView,
   copy: CommerceCopy,
-): Promise<void> {
-  await sendOrThrow(transport, {
+): Promise<number | null> {
+  const result = await transport.sendMessage({
     chatId,
     text: [
       copy.checkout,
@@ -638,6 +833,14 @@ async function sendPhonePrompt(
       one_time_keyboard: true,
     },
   });
+
+  if (!result.ok) {
+    throw new Error(result.error ?? "Telegram send failed");
+  }
+
+  const promptMessageId = result.messageId ?? null;
+  await setStorefrontInputMode(transport, "phone", promptMessageId);
+  return promptMessageId;
 }
 
 async function sendAddressPrompt(
@@ -645,8 +848,8 @@ async function sendAddressPrompt(
   chatId: number,
   copy: CommerceCopy,
   text = copy.addressPrompt,
-): Promise<void> {
-  await sendOrThrow(transport, {
+): Promise<number | null> {
+  const result = await transport.sendMessage({
     chatId,
     text,
     replyMarkup: {
@@ -659,6 +862,14 @@ async function sendAddressPrompt(
       resize_keyboard: true,
     },
   });
+
+  if (!result.ok) {
+    throw new Error(result.error ?? "Telegram send failed");
+  }
+
+  const promptMessageId = result.messageId ?? null;
+  await setStorefrontInputMode(transport, "address", promptMessageId);
+  return promptMessageId;
 }
 
 type PlacedOrderReceipt = {
@@ -683,6 +894,14 @@ function placedOrderText(result: PlacedOrderReceipt, copy: CommerceCopy): string
 }
 
 function placedOrderKeyboard(copy: CommerceCopy) {
+  return {
+    inline_keyboard: [
+      [{ text: copy.home, callback_data: tokens.receiptHome() }],
+    ],
+  };
+}
+
+function bridgeOrderKeyboard(copy: CommerceCopy) {
   return {
     inline_keyboard: [
       [{ text: copy.home, callback_data: tokens.homeNew() }],
@@ -715,11 +934,13 @@ async function renderPlacedOrderBridge(
   result: PlacedOrderReceipt,
   copy: CommerceCopy,
 ): Promise<void> {
+  setStorefrontRoute(transport, "receipt_bridge");
+
   await editOrThrow(transport, {
     chatId,
     messageId,
     text: `${copy.orderPlaced(result.reference)}\n\n${copy.reservedNote}`,
-    replyMarkup: placedOrderKeyboard(copy),
+    replyMarkup: bridgeOrderKeyboard(copy),
   });
 }
 
@@ -731,11 +952,13 @@ async function renderPlacedOrderOnActiveMessage(
   copy: CommerceCopy,
   allowReplacementSend: boolean,
 ): Promise<void> {
+  setStorefrontRoute(transport, "receipt_bridge");
+
   const params = {
     chatId,
     messageId,
     text: placedOrderText(result, copy),
-    replyMarkup: placedOrderKeyboard(copy),
+    replyMarkup: bridgeOrderKeyboard(copy),
   };
 
   if (allowReplacementSend) {
@@ -753,6 +976,8 @@ async function renderLatestCodOrder(
   copy: CommerceCopy,
   buyer: BuyerOrderChat,
 ): Promise<void> {
+  setStorefrontRoute(transport, "order");
+
   const order = await readLatestBuyerCodOrder(db, scope, buyer);
   let text = copy.latestCodOrderUnavailable;
   if (order) {
@@ -835,6 +1060,8 @@ async function renderTransferInstructions(
   locale: ManagedCommerceLocale,
   copy: CommerceCopy,
 ): Promise<void> {
+  setStorefrontRoute(transport, "transfer");
+
   const params = {
     chatId,
     text: transferInstructionsText(order, snapshot, locale, copy),
@@ -861,7 +1088,7 @@ async function renderTransferInstructions(
   if (messageId) {
     await editOrThrow(transport, { ...params, messageId });
   } else {
-    await sendOrThrow(transport, params);
+    await sendActiveOrThrow(transport, params);
   }
 }
 
@@ -894,7 +1121,13 @@ async function sendTransferReferencePrompt(
     throw new Error(result.error ?? "Telegram send failed");
   }
 
-  return result.messageId ?? null;
+  const promptMessageId = result.messageId ?? null;
+  await setStorefrontInputMode(
+    transport,
+    "transfer_reference",
+    promptMessageId,
+  );
+  return promptMessageId;
 }
 
 function transferStateText(
@@ -964,6 +1197,8 @@ async function renderVodafoneOrderState(
   locale: ManagedCommerceLocale,
   copy: CommerceCopy,
 ): Promise<void> {
+  setStorefrontRoute(transport, "transfer");
+
   if (
     state.paymentStatus === "awaiting_transfer" &&
     !state.claim &&
@@ -1002,7 +1237,7 @@ async function renderVodafoneOrderState(
   if (messageId) {
     await editOrThrow(transport, { ...params, messageId });
   } else {
-    await sendOrThrow(transport, params);
+    await sendActiveOrThrow(transport, params);
   }
 }
 
@@ -1023,24 +1258,61 @@ async function sendOrThrow(
   }
 }
 
+async function sendActiveOrThrow(
+  transport: TelegramTransport,
+  params: Parameters<TelegramTransport["sendMessage"]>[0],
+): Promise<void> {
+  const result = await transport.sendMessage({
+    ...params,
+    replyMarkup: bindScreenRevision(transport, params.replyMarkup),
+  });
+  if (!result.ok) {
+    throw new Error(result.error ?? "Telegram send failed");
+  }
+
+  if (result.messageId !== undefined) {
+    await recordActiveStorefrontSafely(transport, result.messageId, false);
+  }
+}
+
 async function editOrThrow(
   transport: TelegramTransport,
   params: Parameters<TelegramTransport["editMessageText"]>[0],
 ): Promise<void> {
-  const result = await transport.editMessageText(params);
+  const replyMarkup = bindScreenRevision(
+    transport,
+    params.replyMarkup,
+  ) as typeof params.replyMarkup;
+  const result = await transport.editMessageText({ ...params, replyMarkup });
 
-  if (result.ok) return;
+  if (result.ok) {
+    await recordActiveStorefrontSafely(
+      transport,
+      result.messageId ?? params.messageId,
+      false,
+    );
+    return;
+  }
 
   // A media message cannot be converted into a text screen. Replace it with a
   // single deliberate text message and retire the superseded controls. A not
   // editable/deleted source is a definite Telegram outcome, so one replacement
   // is safe; timeout and network outcomes are never retried with a new send.
   if (result.errorKind === "not_editable") {
-    await sendOrThrow(transport, {
+    const sent = await transport.sendMessage({
       chatId: params.chatId,
       text: params.text,
-      replyMarkup: params.replyMarkup,
+      replyMarkup,
     });
+
+    if (!sent.ok) {
+      throw new Error(sent.error ?? "Telegram send failed");
+    }
+
+    if (sent.messageId !== undefined) {
+      await recordActiveStorefrontSafely(transport, sent.messageId, false);
+    }
+
     await clearMessageKeyboard(transport, params.chatId, params.messageId);
     return;
   }
@@ -1057,10 +1329,20 @@ async function editOnlyOrThrow(
   transport: TelegramTransport,
   params: Parameters<TelegramTransport["editMessageText"]>[0],
 ): Promise<void> {
-  const result = await transport.editMessageText(params);
+  const replyMarkup = bindScreenRevision(
+    transport,
+    params.replyMarkup,
+  ) as typeof params.replyMarkup;
+  const result = await transport.editMessageText({ ...params, replyMarkup });
   if (!result.ok) {
     throw new Error(result.error ?? "Telegram edit failed");
   }
+
+  await recordActiveStorefrontSafely(
+    transport,
+    result.messageId ?? params.messageId,
+    false,
+  );
 }
 
 function logNavigationContextFailure(
@@ -1191,6 +1473,8 @@ async function renderHome(
   activeMessageHasMedia = false,
   navigation?: NavigationBinding,
 ): Promise<void> {
+  setStorefrontRoute(transport, "home");
+
   const [page, profile] = await Promise.all([
     listManagedProducts(db, scope, { page: 1, pageSize: PAGE_SIZE }, plan),
     readStorefrontProfile(db, scope),
@@ -1261,14 +1545,27 @@ async function renderHome(
   }
 
   if (photo && text.length <= TELEGRAM_MAX_CAPTION_CHARS) {
-    const result = await transport.sendPhoto({ chatId, photo, caption: text, replyMarkup });
-    if (result.ok) return;
+    const result = await transport.sendPhoto({
+      chatId,
+      photo,
+      caption: text,
+      replyMarkup: bindScreenRevision(
+        transport,
+        replyMarkup,
+      ) as typeof replyMarkup,
+    });
+    if (result.ok) {
+      if (result.messageId !== undefined) {
+        await recordActiveStorefrontSafely(transport, result.messageId, true);
+      }
+      return;
+    }
     if (isAmbiguousDelivery(result.errorKind) || result.errorKind === "rate_limited") {
       throw new Error(result.error ?? "Telegram cover delivery failed");
     }
   }
 
-  await sendOrThrow(transport, { chatId, text, replyMarkup });
+  await sendActiveOrThrow(transport, { chatId, text, replyMarkup });
 }
 
 async function renderProducts(
@@ -1282,6 +1579,8 @@ async function renderProducts(
   plan: ManagedCatalogContentPlan,
   navigation?: NavigationBinding,
 ): Promise<void> {
+  setStorefrontRoute(transport, "products");
+
   const page = await listManagedProducts(
     db,
     scope,
@@ -1341,12 +1640,20 @@ async function sendCatalogSearchPrompt(
   chatId: number,
   copy: CommerceCopy,
   invalid = false,
-): Promise<void> {
-  await sendOrThrow(transport, {
+): Promise<number | null> {
+  const result = await transport.sendMessage({
     chatId,
     text: invalid ? `${copy.searchInvalid}\n\n${copy.searchPrompt}` : copy.searchPrompt,
     replyMarkup: { force_reply: true },
   });
+
+  if (!result.ok) {
+    throw new Error(result.error ?? "Telegram send failed");
+  }
+
+  const promptMessageId = result.messageId ?? null;
+  await setStorefrontInputMode(transport, "search", promptMessageId);
+  return promptMessageId;
 }
 
 async function renderCatalogSearch(
@@ -1361,6 +1668,8 @@ async function renderCatalogSearch(
   messageId?: number,
   navigation?: NavigationBinding,
 ): Promise<void> {
+  setStorefrontRoute(transport, "search");
+
   const page = await listManagedProducts(
     db, scope, { page: pageNumber, pageSize: PAGE_SIZE, search: query }, plan,
   );
@@ -1400,7 +1709,7 @@ async function renderCatalogSearch(
   if (messageId !== undefined) {
     await editOrThrow(transport, { ...params, messageId });
   } else {
-    await sendOrThrow(transport, params);
+    await sendActiveOrThrow(transport, params);
   }
 }
 
@@ -1414,6 +1723,8 @@ async function renderCategories(
   copy: CommerceCopy,
   plan: ManagedCatalogContentPlan,
 ): Promise<void> {
+  setStorefrontRoute(transport, "categories");
+
   const page = await listManagedCategories(
     db,
     scope,
@@ -1468,6 +1779,8 @@ async function renderCategory(
   plan: ManagedCatalogContentPlan,
   navigation?: NavigationBinding,
 ): Promise<void> {
+  setStorefrontRoute(transport, "category");
+
   const categoryRow = await readManagedCategory(
     db,
     scope,
@@ -1576,6 +1889,11 @@ async function renderStorefrontCard(
   text: string,
   replyMarkup: { inline_keyboard: TelegramInlineKeyboardButton[][] },
 ): Promise<void> {
+  const boundReplyMarkup = bindScreenRevision(
+    transport,
+    replyMarkup,
+  ) as typeof replyMarkup;
+
   // Captions are shorter than regular messages. A card that cannot fit keeps
   // the complete, usable text path instead of truncating merchant content.
   if (imageUrl && text.length <= TELEGRAM_MAX_CAPTION_CHARS) {
@@ -1584,10 +1902,17 @@ async function renderStorefrontCard(
         chatId,
         messageId,
         media: { type: "photo", media: imageUrl, caption: text },
-        replyMarkup,
+        replyMarkup: boundReplyMarkup,
       });
 
-      if (edited.ok) return;
+      if (edited.ok) {
+        await recordActiveStorefrontSafely(
+          transport,
+          edited.messageId ?? messageId,
+          true,
+        );
+        return;
+      }
 
       if (isAmbiguousDelivery(edited.errorKind)) {
         // The edit may have reached Telegram. A retried update can safely
@@ -1600,10 +1925,13 @@ async function renderStorefrontCard(
         chatId,
         photo: imageUrl,
         caption: text,
-        replyMarkup,
+        replyMarkup: boundReplyMarkup,
       });
 
       if (sent.ok) {
+        if (sent.messageId !== undefined) {
+          await recordActiveStorefrontSafely(transport, sent.messageId, true);
+        }
         // Text -> photo needs a replacement message. Retire the old controls
         // so only the replacement acts as the active storefront.
         await clearMessageKeyboard(transport, chatId, messageId);
@@ -1646,6 +1974,8 @@ async function renderProduct(
   productId: string,
   navigationToken?: string | null,
 ): Promise<void> {
+  setStorefrontRoute(transport, "product");
+
   const productRow = await readManagedProduct(
     db,
     scope,
@@ -1969,6 +2299,7 @@ async function dispatchMessage(
   commerceDb: TransactionDatabase | null,
   transport: TelegramTransport,
   message: TelegramMessage,
+  updateId: number,
 ): Promise<void> {
   const text = typeof message.text === "string" ? message.text.trim() : "";
   const buyerId = message.from?.id ?? null;
@@ -1981,6 +2312,25 @@ async function dispatchMessage(
         telegramUserId: buyerId,
         telegramChatId: message.chat.id,
       };
+  const active = navigation
+    ? await readActiveStorefrontSafely(db, navigation)
+    : null;
+  if (navigation) {
+    attachStorefrontLifecycle(transport, {
+      db,
+      binding: navigation,
+      updateId,
+      active,
+      route: active?.route ?? "storefront",
+      screenRevision: (active?.revision ?? 0) + 1,
+    });
+  }
+  // Message inputs follow the same ordering as callbacks. A delayed reply
+  // cannot be consumed after a newer screen or prompt has advanced the scope.
+  if (active !== null && active.lastUpdateId > updateId) return;
+
+  const activeMessageId = active?.messageId;
+  const activeMessageHasMedia = active?.hasMedia ?? false;
   const context = await languageContextFor(
     db,
     scope,
@@ -1999,7 +2349,7 @@ async function dispatchMessage(
       plan,
       transport,
       message.chat.id,
-      undefined,
+      activeMessageId,
       homeRecoveryFor(
         commerceDb,
         connectionId,
@@ -2007,7 +2357,7 @@ async function dispatchMessage(
         message.chat.id,
         context.language.locale,
       ),
-      false,
+      activeMessageHasMedia,
       navigation,
     );
     return;
@@ -2034,7 +2384,7 @@ async function dispatchMessage(
     await renderLanguageMenu(
       transport,
       message.chat.id,
-      undefined,
+      activeMessageId,
       copy,
       context.language.locale,
     );
@@ -2044,6 +2394,15 @@ async function dispatchMessage(
   const reply = message.reply_to_message;
   if (reply?.from?.id === botId && reply.from.is_bot === true &&
       reply.chat?.id === message.chat.id && matchesSearchPrompt(reply.text)) {
+    // The reply must belong to the currently pending search prompt. An older
+    // search prompt reply is ignored rather than replacing a newer screen or
+    // being consumed as phone/address checkout input.
+    const pendingSearch =
+      active?.inputMode === "search" &&
+      (active.inputPromptMessageId === null ||
+        active.inputPromptMessageId === reply.message_id);
+    if (!pendingSearch) return;
+
     const query = managedSearchQuery(text);
     if (query) {
       await renderCatalogSearch(
@@ -2055,7 +2414,7 @@ async function dispatchMessage(
         1,
         copy,
         plan,
-        undefined,
+        activeMessageId,
         navigation,
       );
     } else {
@@ -2085,7 +2444,7 @@ async function dispatchMessage(
       await renderCartView(
         transport,
         message.chat.id,
-        undefined,
+        activeMessageId,
         cart
           ? await localizeCartView(db, scope, cart, plan, copy)
           : null,
@@ -2096,6 +2455,13 @@ async function dispatchMessage(
 
     if (activeCart?.status === "checkout") {
       if (activeCart.checkoutState === "awaiting_phone") {
+        if (
+          active &&
+          active.inputMode !== "none" &&
+          active.inputMode !== "phone"
+        ) {
+          return;
+        }
         const contact = message.contact;
 
         if (
@@ -2134,6 +2500,13 @@ async function dispatchMessage(
       }
 
       if (activeCart.checkoutState === "awaiting_address") {
+        if (
+          active &&
+          active.inputMode !== "none" &&
+          active.inputMode !== "address"
+        ) {
+          return;
+        }
         const result = await saveAddressAndPrepareReview(commerceDb, scope, {
           cartId: activeCart.id,
           connectionId,
@@ -2145,7 +2518,7 @@ async function dispatchMessage(
           await renderReviewView(
             transport,
             message.chat.id,
-            undefined,
+            activeMessageId,
             await localizeReview(db, scope, result.review, plan, copy),
             copy,
             cod.vodafoneCashEnabled,
@@ -2167,23 +2540,30 @@ async function dispatchMessage(
           await renderCartView(
             transport,
             message.chat.id,
-            undefined,
+            activeMessageId,
             null,
             copy,
           );
           return;
         }
 
-        await sendOrThrow(transport, {
+        setStorefrontRoute(transport, "notice");
+        const unavailable = {
           chatId: message.chat.id,
           text: copy.stockIssue,
           replyMarkup: {
             inline_keyboard: [
               [{ text: copy.cart, callback_data: tokens.cart() }],
               ...homeKeyboard(copy),
-            ],
+            ] as TelegramInlineKeyboardButton[][],
           },
-        });
+        };
+
+        if (activeMessageId !== undefined) {
+          await editOrThrow(transport, { ...unavailable, messageId: activeMessageId });
+        } else {
+          await sendActiveOrThrow(transport, unavailable);
+        }
         return;
       }
     }
@@ -2193,6 +2573,16 @@ async function dispatchMessage(
     const promptMessageId = repliedMessageId(message);
 
     if (promptMessageId !== null) {
+      if (
+        active &&
+        active.inputMode !== "none" &&
+        (active.inputMode !== "transfer_reference" ||
+          (active.inputPromptMessageId !== null &&
+            active.inputPromptMessageId !== promptMessageId))
+      ) {
+        return;
+      }
+
       const state = await readVodafoneCashOrderByPromptReply(
         commerceDb,
         scope,
@@ -2278,7 +2668,7 @@ async function dispatchMessage(
             await renderVodafoneOrderState(
               transport,
               message.chat.id,
-              undefined,
+              activeMessageId,
               latest,
               context.language.locale,
               copy,
@@ -2289,7 +2679,7 @@ async function dispatchMessage(
           await renderVodafoneOrderState(
             transport,
             message.chat.id,
-            undefined,
+            activeMessageId,
             state,
             context.language.locale,
             copy,
@@ -2312,7 +2702,7 @@ async function dispatchMessage(
     plan,
     transport,
     message.chat.id,
-    undefined,
+    activeMessageId,
     homeRecoveryFor(
       commerceDb,
       connectionId,
@@ -2320,7 +2710,7 @@ async function dispatchMessage(
       message.chat.id,
       context.language.locale,
     ),
-    false,
+    activeMessageHasMedia,
     navigation,
   );
 }
@@ -2339,6 +2729,8 @@ async function renderAfterLanguageChange(
   context: LanguageContext,
   navigation: NavigationBinding,
 ): Promise<void> {
+  setStorefrontRoute(transport, "language");
+
   const { copy, plan } = context;
 
   if (cod.enabled && commerceDb) {
@@ -2579,26 +2971,26 @@ async function dispatchCallback(
   transport: TelegramTransport,
   callbackQuery: {
     id: string;
+    data?: string;
     message?: TelegramMessage;
     from: { id: number; first_name?: string; language_code?: string };
   },
   parsedToken: ParsedToken,
   updateAttempt: ManagedUpdateAttempt,
 ): Promise<void> {
-  const ack = await transport.answerCallbackQuery({
-    callbackQueryId: callbackQuery.id,
-  });
-
-  if (!ack.ok && ack.errorKind !== "callback_expired") {
-    throw new Error(ack.error ?? "Failed to answer callback query");
+  const message = callbackQuery.message;
+  if (!message) {
+    const ack = await transport.answerCallbackQuery({
+      callbackQueryId: callbackQuery.id,
+    });
+    if (!ack.ok && ack.errorKind !== "callback_expired") {
+      throw new Error(ack.error ?? "Failed to answer callback query");
+    }
+    return;
   }
 
-  const message = callbackQuery.message;
-  if (!message) return;
-
   const chatId = message.chat.id;
-  const messageId = message.message_id;
-  const activeMessageHasMedia = messageHasPhoto(message);
+  const callbackMessageId = message.message_id;
   const buyerId = callbackQuery.from.id;
   const navigation: NavigationBinding = {
     storeId: scope.storeId,
@@ -2607,6 +2999,7 @@ async function dispatchCallback(
     telegramUserId: buyerId,
     telegramChatId: chatId,
   };
+  const active = await readActiveStorefrontSafely(db, navigation);
   let context = await languageContextFor(
     db,
     scope,
@@ -2614,6 +3007,138 @@ async function dispatchCallback(
     callbackQuery.from.language_code,
   );
   let { copy, plan } = context;
+
+  attachStorefrontLifecycle(transport, {
+    db,
+    binding: navigation,
+    updateId: updateAttempt.updateId,
+    active,
+    route: active?.route ?? "storefront",
+    screenRevision: (active?.revision ?? 0) + 1,
+  });
+
+  const callbackRevision = screenRevisionFromData(callbackQuery.data);
+  const receiptHome = parsedToken.type === "receiptHome";
+  const confirmation =
+    parsedToken.type === "confirmCod" ||
+    parsedToken.type === "confirmVodafoneCash";
+
+  // Confirmation controls need positive evidence before a NEW order: a
+  // verified active review screen, the same message, a carried revision that
+  // matches it, and update ordering that is not older than that screen. A
+  // missing/failed state read or any mismatch is treated as unverified.
+  const orderingStale =
+    active !== null &&
+    (active.lastUpdateId > updateAttempt.updateId ||
+      callbackMessageId < active.messageId);
+  const revisionMismatch =
+    active !== null &&
+    !receiptHome &&
+    callbackRevision !== null &&
+    callbackRevision !== active.revision;
+
+  const confirmationVerified =
+    confirmation &&
+    active !== null &&
+    active.route === "review" &&
+    callbackMessageId === active.messageId &&
+    callbackRevision !== null &&
+    callbackRevision === active.revision &&
+    active.lastUpdateId <= updateAttempt.updateId;
+
+  const stale =
+    !receiptHome &&
+    !confirmation &&
+    active !== null &&
+    (orderingStale || revisionMismatch);
+  const confirmationStale = confirmation && !confirmationVerified;
+
+  let confirmationRecoveryReference: string | null = null;
+  if (
+    confirmationStale &&
+    (parsedToken.type === "confirmCod" ||
+      parsedToken.type === "confirmVodafoneCash")
+  ) {
+    const existing = await readConfirmationRecoverySafely(
+      commerceDb ?? db,
+      scope,
+      {
+        cartId: parsedToken.cartId,
+        connectionId,
+        telegramUserId: buyerId,
+        telegramChatId: chatId,
+        paymentMethod:
+          parsedToken.type === "confirmCod" ? "cod" : "vodafone_cash",
+      },
+    );
+    confirmationRecoveryReference = existing?.reference ?? null;
+  }
+
+  const ack = await transport.answerCallbackQuery({
+    callbackQueryId: callbackQuery.id,
+    ...(stale
+      ? { text: copy.staleScreen }
+      : confirmationStale
+        ? {
+            text: confirmationRecoveryReference
+              ? copy.confirmationAlreadyPlaced(confirmationRecoveryReference)
+              : copy.staleConfirmation,
+          }
+        : {}),
+  });
+
+  if (!ack.ok && ack.errorKind !== "callback_expired") {
+    throw new Error(ack.error ?? "Failed to answer callback query");
+  }
+
+  if (stale) {
+    // The keyboard clear may have failed earlier; validate the callback here
+    // and retire the old controls if Telegram still permits it.
+    if (
+      callbackMessageId !== active.messageId &&
+      parsedToken.type !== "homeNew"
+    ) {
+      await clearMessageKeyboard(transport, chatId, callbackMessageId);
+    }
+    return;
+  }
+
+  if (confirmationStale) {
+    // Recovery is acknowledgement-only: never edit, replace or adopt the
+    // active storefront, issue new controls, or touch the receipt.
+    return;
+  }
+
+  let targetMessageId: number | undefined = callbackMessageId;
+  let targetHasMedia = messageHasPhoto(message);
+
+  if (receiptHome) {
+    targetMessageId = active?.messageId;
+    targetHasMedia = active?.hasMedia ?? false;
+  } else if (parsedToken.type === "homeNew") {
+    targetMessageId = undefined;
+  } else if (active) {
+    if (callbackMessageId <= active.messageId) {
+      targetMessageId = active.messageId;
+      targetHasMedia = active.hasMedia;
+    }
+  }
+
+  if (
+    !receiptHome &&
+    parsedToken.type !== "homeNew" &&
+    targetMessageId !== undefined &&
+    (!active || targetMessageId !== active.messageId)
+  ) {
+    await adoptActiveStorefrontSafely(
+      transport,
+      targetMessageId,
+      targetHasMedia,
+    );
+  }
+
+  const messageId = targetMessageId ?? callbackMessageId;
+  const activeMessageHasMedia = targetHasMedia;
 
   if (parsedToken.type === "catalogSearch") {
     await sendCatalogSearchPrompt(transport, chatId, copy);
@@ -3314,6 +3839,33 @@ async function dispatchCallback(
     }
   }
 
+  if (parsedToken.type === "receiptHome") {
+    // A receipt is independent of the storefront. Reuse the active storefront
+    // when one exists; otherwise send the first one. Never edit or clear the
+    // receipt itself.
+    await renderHome(
+      db,
+      scope,
+      storeName,
+      cod,
+      copy,
+      plan,
+      transport,
+      chatId,
+      targetMessageId,
+      homeRecoveryFor(
+        commerceDb,
+        connectionId,
+        buyerId,
+        chatId,
+        context.language.locale,
+      ),
+      targetHasMedia,
+      navigation,
+    );
+    return;
+  }
+
   if (parsedToken.type === "homeNew") {
     await renderHome(
       db,
@@ -3335,6 +3887,12 @@ async function dispatchCallback(
       false,
       navigation,
     );
+
+    // The fresh home is now active. Retire the old bridge controls without
+    // touching the independent order receipt.
+    if (active && active.messageId !== undefined) {
+      await clearMessageKeyboard(transport, chatId, active.messageId);
+    }
     return;
   }
 
@@ -3530,6 +4088,8 @@ export async function handleManagedTelegramWebhookRequest(
     options?.deadline ?? new StandardExecutionDeadline(budgetMs, options?.now);
 
   let attemptToken: string | undefined;
+  let storefrontLockToken: string | undefined;
+  let storefrontBinding: ActiveStorefrontBinding | undefined;
 
   try {
     const claim = await claimManagedTelegramUpdate(db, {
@@ -3558,6 +4118,37 @@ export async function handleManagedTelegramWebhookRequest(
 
     attemptToken = claim.attemptToken;
     deadline.checkOrThrow();
+
+    const updateMessage =
+      validation.data.updateType === "message"
+        ? validation.data.message
+        : undefined;
+    const updateCallback =
+      validation.data.updateType === "callback_query"
+        ? validation.data.callbackQuery
+        : undefined;
+    const storefrontChatId =
+      updateMessage?.chat.id ?? updateCallback?.message?.chat.id;
+    const storefrontBuyerId =
+      updateMessage?.from?.id ?? updateCallback?.from.id;
+
+    if (storefrontChatId !== undefined && storefrontBuyerId !== undefined) {
+      storefrontBinding = {
+        storeId: connection.storeId,
+        connectionId: connection.id,
+        botId: connection.botId,
+        telegramUserId: storefrontBuyerId,
+        telegramChatId: storefrontChatId,
+      };
+
+      const acquired = await acquireStorefrontLock(
+        db,
+        storefrontBinding,
+        claim.attemptToken,
+      );
+      if (!acquired) throw new StorefrontScopeBusyError();
+      storefrontLockToken = claim.attemptToken;
+    }
 
     const scope = await createStoreScopeForExistingStore(
       db,
@@ -3609,6 +4200,7 @@ export async function handleManagedTelegramWebhookRequest(
         commerceDb,
         transport,
         validation.data.message,
+        update.update_id,
       );
     } else {
       await dispatchCallback(
@@ -3654,6 +4246,19 @@ export async function handleManagedTelegramWebhookRequest(
       }
     }
 
+    if (error instanceof StorefrontScopeBusyError) {
+      return new Response(
+        JSON.stringify({ error: "Storefront update is busy" }),
+        {
+          status: 429,
+          headers: {
+            "Content-Type": "application/json",
+            "Retry-After": "5",
+          },
+        },
+      );
+    }
+
     if (
       diagnostic.category === "rate_limited" &&
       diagnostic.retryAfterSeconds !== undefined
@@ -3684,5 +4289,13 @@ export async function handleManagedTelegramWebhookRequest(
     }
 
     return json({ error: "Internal server error" }, 500);
+  } finally {
+    if (storefrontBinding && storefrontLockToken) {
+      try {
+        await releaseStorefrontLock(db, storefrontBinding, storefrontLockToken);
+      } catch {
+        // The lease expires on its own; release failure must not mask the result.
+      }
+    }
   }
 }

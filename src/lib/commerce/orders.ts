@@ -137,7 +137,7 @@ export type TransferSnapshot = {
   capturedAt: string;
 };
 
-type OrderReceipt = {
+export type OrderReceipt = {
   reference: string;
   orderId: string;
   subtotal: string;
@@ -1856,6 +1856,78 @@ async function findOrderByCheckoutKey(
       and(
         eq(orderTable.storeId, scope.storeId),
         eq(orderTable.checkoutKey, checkoutKey),
+      ),
+    )
+    .limit(1);
+
+  return row
+    ? {
+        ...row,
+        paymentMethod: row.paymentMethod as PaymentMethod,
+        transferSnapshot: parseTransferSnapshot(row.transferSnapshot),
+      }
+    : null;
+}
+
+
+/**
+ * Read-only recovery for a confirmation control that belongs to a previous
+ * screen. It never writes: it resolves the cart by the verified store,
+ * connection and buyer, then returns the order already committed under that
+ * cart's checkout key only when the order still matches the same connection,
+ * buyer, chat and payment method.
+ */
+export async function readPlacedOrderForCart(
+  db: TransactionDatabase | Database,
+  scope: StoreScope,
+  input: {
+    cartId: string;
+    connectionId: string;
+    telegramUserId: number;
+    telegramChatId: number;
+    paymentMethod: PaymentMethod;
+  },
+): Promise<OrderReceipt | null> {
+  assertStoreScope(scope);
+
+  const queryDb = db as unknown as Database;
+  const [cartRow] = await queryDb
+    .select({
+      checkoutKey: cart.checkoutKey,
+    })
+    .from(cart)
+    .where(
+      and(
+        eq(cart.id, input.cartId),
+        eq(cart.storeId, scope.storeId),
+        eq(cart.connectionId, input.connectionId),
+        eq(cart.telegramUserId, input.telegramUserId),
+      ),
+    )
+    .limit(1);
+
+  if (!cartRow?.checkoutKey) return null;
+
+  const [row] = await queryDb
+    .select({
+      orderId: orderTable.id,
+      reference: orderTable.reference,
+      subtotal: orderTable.subtotal,
+      deliveryFee: orderTable.deliveryFee,
+      total: orderTable.total,
+      currency: orderTable.currency,
+      paymentMethod: orderTable.paymentMethod,
+      transferSnapshot: orderTable.transferSnapshot,
+    })
+    .from(orderTable)
+    .where(
+      and(
+        eq(orderTable.storeId, scope.storeId),
+        eq(orderTable.checkoutKey, cartRow.checkoutKey),
+        eq(orderTable.connectionId, input.connectionId),
+        eq(orderTable.telegramUserId, input.telegramUserId),
+        eq(orderTable.telegramChatId, input.telegramChatId),
+        eq(orderTable.paymentMethod, input.paymentMethod),
       ),
     )
     .limit(1);

@@ -3,8 +3,11 @@ import { describe, expect, it } from "vitest";
 import {
   assertValidCallbackData,
   parseToken,
+  screenRevisionFromData,
   TELEGRAM_MAX_CALLBACK_DATA_BYTES,
   tokens,
+  withScreenRevision,
+  withoutScreenRevision,
 } from "@/lib/telegram/tokens";
 
 describe("telegram tokens", () => {
@@ -431,4 +434,49 @@ describe("telegram tokens", () => {
     const overlength = "c:" + "a".repeat(70);
     expect(parseToken(overlength)).toEqual({ type: "unknown", raw: overlength });
   });
+  it("binds screen revisions without changing the parsed action", () => {
+    expect(tokens.receiptHome()).toBe("home:receipt");
+    expect(parseToken(tokens.receiptHome())).toEqual({ type: "receiptHome" });
+
+    const bound = withScreenRevision(tokens.products(2), 1234);
+    expect(bound.startsWith("prods:2~")).toBe(true);
+    expect(screenRevisionFromData(bound)).toBe(1234);
+    expect(withoutScreenRevision(bound)).toBe("prods:2");
+    expect(parseToken(bound)).toEqual({ type: "products", page: 2 });
+    expect(parseToken("prods:2~bad!")).toEqual({
+      type: "unknown",
+      raw: "prods:2~bad!",
+    });
+
+    // The longest storefront language callback stays within Telegram's limit
+    // across the old modulo boundary, and the encoded identities stay distinct.
+    const languageContext = `lang:ar:pd:${uuid}:${navToken}`;
+    const listLanguageContext = `langs:pd:${uuid}:${navToken}`;
+    const encoded = new Set<string>();
+    for (const revision of [46_655, 46_656, 46_657]) {
+      const longest = withScreenRevision(languageContext, revision);
+      const longestList = withScreenRevision(listLanguageContext, revision);
+      expect(Buffer.byteLength(longest, "utf8")).toBeLessThanOrEqual(
+        TELEGRAM_MAX_CALLBACK_DATA_BYTES,
+      );
+      expect(Buffer.byteLength(longestList, "utf8")).toBeLessThanOrEqual(
+        TELEGRAM_MAX_CALLBACK_DATA_BYTES,
+      );
+      expect(screenRevisionFromData(longest)).toBe(revision);
+      expect(screenRevisionFromData(longestList)).toBe(revision);
+      expect(parseToken(longest)).toEqual({
+        type: "lang",
+        code: "ar",
+        context: `pd:${uuid}:${navToken}`,
+      });
+      expect(parseToken(longestList)).toEqual({
+        type: "languages",
+        context: `pd:${uuid}:${navToken}`,
+      });
+      encoded.add(longest);
+      encoded.add(longestList);
+    }
+    expect(encoded.size).toBe(6);
+  });
+
 });

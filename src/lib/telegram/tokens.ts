@@ -12,6 +12,11 @@ export const UUID_REGEX =
 export const LANG_CODE_REGEX = /^[a-z]{2}$/;
 export const PAGE_REGEX = /^[1-9][0-9]{0,4}$/;
 export const NAVIGATION_TOKEN_REGEX = /^[A-Za-z0-9_-]{12}$/;
+const LEGACY_SCREEN_REVISION_PATTERN = /^[0-9a-z]{1,3}$/;
+const SCREEN_REVISION_PATTERN = /^[0-9A-Za-z]{5}$/;
+const SCREEN_REVISION_ALPHABET =
+  "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+const SCREEN_REVISION_MAX = 62 ** 5 - 1;
 const LANGUAGE_CONTEXT_PATTERN =
   /^(?:h|cod|p:[1-9][0-9]{0,4}|cs|c:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?::[1-9][0-9]{0,4})?|pd:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?::[A-Za-z0-9_-]{12})?|to:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
 
@@ -27,6 +32,104 @@ function assertLanguageContext(context: string | undefined): string | null {
   return context;
 }
 
+function encodeScreenRevision(revision: number): string {
+  if (!Number.isInteger(revision) || revision < 1) {
+    throw new Error(`Invalid screen revision: ${revision}`);
+  }
+  if (revision > SCREEN_REVISION_MAX) {
+    throw new Error(`Screen revision exceeds callback capacity: ${revision}`);
+  }
+
+  let value = revision;
+  let encoded = "";
+  for (let index = 0; index < 5; index += 1) {
+    encoded =
+      SCREEN_REVISION_ALPHABET[value % SCREEN_REVISION_ALPHABET.length] +
+      encoded;
+    value = Math.floor(value / SCREEN_REVISION_ALPHABET.length);
+  }
+  return encoded;
+}
+
+function decodeScreenRevision(encoded: string): number | null {
+  if (SCREEN_REVISION_PATTERN.test(encoded)) {
+    let value = 0;
+    for (const character of encoded) {
+      const digit = SCREEN_REVISION_ALPHABET.indexOf(character);
+      if (digit === -1) return null;
+      value = value * SCREEN_REVISION_ALPHABET.length + digit;
+    }
+    return value;
+  }
+
+  // Legacy 1-3 character base36 suffixes from the first revision-bound build.
+  return LEGACY_SCREEN_REVISION_PATTERN.test(encoded)
+    ? parseInt(encoded, 36)
+    : null;
+}
+
+/**
+ * The longest language callback (`lang:ar:pd:<uuid>:<12-char nav>`) needs one
+ * byte of room for the five-character revision suffix. Dropping the explicit
+ * `pd:` marker is lossless because the parser normalizes a bare product UUID
+ * (with optional navigation token) back to the same context.
+ */
+function compactScreenRevisionData(data: string): string {
+  if (Buffer.byteLength(data, "utf8") + 6 <= TELEGRAM_MAX_CALLBACK_DATA_BYTES) {
+    return data;
+  }
+
+  const productLanguage =
+    /^lang:([a-z]{2}):pd:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}):([A-Za-z0-9_-]{12})$/i.exec(
+      data,
+    );
+  return productLanguage
+    ? `lang:${productLanguage[1]}:${productLanguage[2]}:${productLanguage[3]}`
+    : data;
+}
+
+export function withScreenRevision(data: string, revision: number): string {
+  return assertValidCallbackData(
+    `${compactScreenRevisionData(data)}~${encodeScreenRevision(revision)}`,
+  );
+}
+
+export function withoutScreenRevision(data: string): string {
+  return stripScreenRevision(data) ?? data;
+}
+
+export function screenRevisionFromData(data?: string): number | null {
+  if (typeof data !== "string") return null;
+  const separator = data.lastIndexOf("~");
+  if (separator === -1) return null;
+  return decodeScreenRevision(data.slice(separator + 1));
+}
+
+function stripScreenRevision(data: string): string | null {
+  const separator = data.lastIndexOf("~");
+  if (separator === -1) return data;
+  if (decodeScreenRevision(data.slice(separator + 1)) === null) return null;
+  const base = data.slice(0, separator);
+  return base.length > 0 ? base : null;
+}
+
+function normalizeLanguageContext(context: string): string | null {
+  if (LANGUAGE_CONTEXT_PATTERN.test(context)) return context;
+
+  const parts = context.split(":");
+  if (parts.length === 1 && UUID_REGEX.test(parts[0])) {
+    return `pd:${parts[0]}`;
+  }
+  if (
+    parts.length === 2 &&
+    UUID_REGEX.test(parts[0]) &&
+    isNavigationToken(parts[1])
+  ) {
+    return `pd:${parts[0]}:${parts[1]}`;
+  }
+  return null;
+}
+
 export function assertValidCallbackData(data: string): string {
   const byteLen = Buffer.byteLength(data, "utf8");
   if (byteLen < 1 || byteLen > TELEGRAM_MAX_CALLBACK_DATA_BYTES) {
@@ -40,6 +143,7 @@ export function assertValidCallbackData(data: string): string {
 export const tokens = {
   home: (): string => assertValidCallbackData("home"),
   homeNew: (): string => assertValidCallbackData("home:new"),
+  receiptHome: (): string => assertValidCallbackData("home:receipt"),
   catalogSearch: (): string => assertValidCallbackData("catalog-search"),
   catalogSearchPage: (page: number): string => {
     if (!PAGE_REGEX.test(String(page))) throw new Error(`Invalid page number: ${page}`);
@@ -245,6 +349,7 @@ export const tokens = {
 export type ParsedToken =
   | { type: "home" }
   | { type: "homeNew" }
+  | { type: "receiptHome" }
   | { type: "catalogSearch" }
   | { type: "catalogSearchPage"; page: number }
   | { type: "latestCodOrder" }
@@ -284,6 +389,12 @@ export function parseToken(data?: string): ParsedToken {
     return { type: "unknown", raw: "" };
   }
 
+  const stripped = stripScreenRevision(data);
+  if (stripped === null) {
+    return { type: "unknown", raw: data };
+  }
+  data = stripped;
+
   const byteLen = Buffer.byteLength(data, "utf8");
   if (byteLen < 1 || byteLen > TELEGRAM_MAX_CALLBACK_DATA_BYTES) {
     return { type: "unknown", raw: data };
@@ -295,6 +406,10 @@ export function parseToken(data?: string): ParsedToken {
 
   if (data === "home:new") {
     return { type: "homeNew" };
+  }
+
+  if (data === "home:receipt") {
+    return { type: "receiptHome" };
   }
 
   if (data === "catalog-search") return { type: "catalogSearch" };
@@ -512,8 +627,8 @@ export function parseToken(data?: string): ParsedToken {
       return { type: "lang", code, context: null };
     }
 
-    const context = parts.slice(1).join(":");
-    return LANGUAGE_CONTEXT_PATTERN.test(context)
+    const context = normalizeLanguageContext(parts.slice(1).join(":"));
+    return context
       ? { type: "lang", code, context }
       : { type: "unknown", raw: data };
   }

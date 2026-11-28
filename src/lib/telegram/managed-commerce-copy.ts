@@ -38,6 +38,9 @@ export type CommerceCopy = {
   languageEnglish: string;
   languageSaved: string;
   invalidLanguage: string;
+  staleScreen: string;
+  staleConfirmation: string;
+  confirmationAlreadyPlaced: (reference: string) => string;
   askSellerOnTelegram: string;
   telegramSupportDraft: (productName: string) => string;
   welcome: (storeName: string) => string;
@@ -138,6 +141,12 @@ const COPY: Record<ManagedCommerceLocale, CommerceCopy> = {
     languageSaved: "Language updated.",
     invalidLanguage:
       "That language is not available. Choose Arabic or English.",
+    staleScreen:
+      "This screen is no longer active. Use the newest storefront message.",
+    staleConfirmation:
+      "This confirmation is no longer active. Reopen the review from the cart.",
+    confirmationAlreadyPlaced: (reference) =>
+      `Order ${reference} was already placed. Open it from the storefront or the latest order button.`,
     askSellerOnTelegram: "Ask the seller on Telegram",
     telegramSupportDraft: (productName) =>
       `Hi, I have a question about ${productName}: `,
@@ -258,6 +267,12 @@ const COPY: Record<ManagedCommerceLocale, CommerceCopy> = {
     languageEnglish: "English",
     languageSaved: "تم تحديث اللغة.",
     invalidLanguage: "هذه اللغة غير متاحة. اختر العربية أو الإنجليزية.",
+    staleScreen:
+      "هذه الشاشة لم تعد نشطة. استخدم أحدث رسالة في المتجر.",
+    staleConfirmation:
+      "هذا التأكيد لم يعد نشطًا. أعد فتح المراجعة من السلة.",
+    confirmationAlreadyPlaced: (reference) =>
+      `تم تسجيل الطلب ${reference} بالفعل. افتحه من المتجر أو من زر آخر طلب.`,
     askSellerOnTelegram: "اسأل البائع على Telegram",
     telegramSupportDraft: (productName) =>
       `مرحبًا، عندي سؤال عن ${productName}: `,

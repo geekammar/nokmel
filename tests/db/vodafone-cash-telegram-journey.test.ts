@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 
 import {
   appUser,
@@ -16,12 +16,15 @@ import {
   storeCommerceSetting,
   storeLanguageSetting,
   storeMembership,
+  telegramActiveStorefront,
   telegramConnection,
 } from "@/db/schema";
+import type { Database } from "@/db/client";
 import type { TransactionDatabase } from "@/db/transaction-client";
 import { rejectVodafoneCashTransfer, verifyVodafoneCashTransfer } from "@/lib/commerce/orders";
 import { hashWebhookSecret } from "@/lib/telegram/connection-secrets";
 import { handleManagedTelegramWebhookRequest } from "@/lib/telegram/managed-webhook";
+import { withoutScreenRevision } from "@/lib/telegram/tokens";
 import {
   createFakeTelegramTransport,
   type FakeTelegramTransport,
@@ -182,7 +185,9 @@ beforeEach(async () => {
       "order_item",
       "order",
       "cart_item",
-      "cart"
+      "cart",
+      "telegram_active_storefront",
+      "telegram_storefront_lock"
     restart identity cascade
   `);
 
@@ -290,18 +295,65 @@ function callbackUpdate(buyerId: number, data: string, messageId?: number) {
 async function call(
   body: unknown,
   transport: FakeTelegramTransport = createFakeTelegramTransport(),
+  options?: { db?: Database },
 ) {
   const response = await handleManagedTelegramWebhookRequest(
     webhookRequest(body),
     fixture.connectionId,
     {
-      db: asAppDb(db()),
+      db: options?.db ?? asAppDb(db()),
       commerceDb: tx(),
       transport,
     },
   );
 
   return { status: response.status, transport };
+}
+
+
+function activeReadFailingDb(): Database {
+  const real = asAppDb(db());
+
+  return new Proxy(real, {
+    get(target, property, receiver) {
+      if (property === "select") {
+        return (...args: unknown[]) => {
+          const select = Reflect.get(target, property) as (
+            ...values: unknown[]
+          ) => object;
+          const query = select.apply(target, args);
+
+          return new Proxy(query, {
+            get(queryTarget, queryProperty, queryReceiver) {
+              if (queryProperty === "from") {
+                return (table: unknown) => {
+                  if (table === telegramActiveStorefront) {
+                    throw new Error("active storefront read failed");
+                  }
+                  const from = Reflect.get(queryTarget, queryProperty) as (
+                    value: unknown,
+                  ) => unknown;
+                  return from.call(queryTarget, table);
+                };
+              }
+
+              const value = Reflect.get(
+                queryTarget,
+                queryProperty,
+                queryReceiver,
+              );
+              return typeof value === "function"
+                ? value.bind(queryTarget)
+                : value;
+            },
+          });
+        };
+      }
+
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  }) as Database;
 }
 
 function inlineButtons(message: { replyMarkup?: unknown }) {
@@ -332,21 +384,12 @@ function lastMessageButtons(transport: FakeTelegramTransport) {
   return message ? inlineButtons(message) : [];
 }
 
-function lastSentButtons(transport: FakeTelegramTransport) {
-  const message = transport.sentMessages.at(-1);
-  return message ? inlineButtons(message) : [];
-}
-
 function lastText(transport: FakeTelegramTransport) {
   return (
     transport.editedMessages.at(-1)?.text ??
     transport.sentMessages.at(-1)?.text ??
     ""
   );
-}
-
-function lastSentText(transport: FakeTelegramTransport) {
-  return transport.sentMessages.at(-1)?.text ?? "";
 }
 
 async function reviewCart(
@@ -386,7 +429,9 @@ async function reviewCart(
   );
   expect(reviewed.status).toBe(200);
 
-  const reviewMessage = reviewed.transport.sentMessages.at(-1);
+  const reviewMessage =
+    reviewed.transport.editedMessages.at(-1) ??
+    reviewed.transport.sentMessages.at(-1);
   const vodafoneButton = inlineButtons(reviewMessage!).find((button) =>
     button.callback_data?.startsWith("cv:"),
   );
@@ -395,7 +440,9 @@ async function reviewCart(
     transport: reviewed.transport,
     reviewMessage,
     vodafoneButton,
-    cartId: checkoutButton!.callback_data!.slice(3),
+    cartId: withoutScreenRevision(
+      checkoutButton!.callback_data!,
+    ).slice(3),
   };
 }
 
@@ -407,7 +454,11 @@ async function placeVodafoneOrder(
   expect(reviewed.vodafoneButton?.callback_data).toBeDefined();
 
   const placed = await call(
-    callbackUpdate(buyerId, reviewed.vodafoneButton!.callback_data!),
+    callbackUpdate(
+      buyerId,
+      reviewed.vodafoneButton!.callback_data!,
+      reviewed.reviewMessage!.messageId,
+    ),
     reviewed.transport,
   );
   expect(placed.status).toBe(200);
@@ -419,10 +470,16 @@ async function placeVodafoneOrder(
 
   const referenceButton = lastButton(placed.transport, "tr:");
   expect(referenceButton?.callback_data).toBeDefined();
-  const orderId = referenceButton!.callback_data!.slice(3);
+  const orderId = withoutScreenRevision(
+    referenceButton!.callback_data!,
+  ).slice(3);
 
   const prompt = await call(
-    callbackUpdate(buyerId, referenceButton!.callback_data!),
+    callbackUpdate(
+      buyerId,
+      referenceButton!.callback_data!,
+      instructionsMessageId!,
+    ),
     placed.transport,
   );
   expect(prompt.status).toBe(200);
@@ -449,7 +506,11 @@ async function placeVodafoneOrderWithoutPrompt(
   expect(reviewed.vodafoneButton?.callback_data).toBeDefined();
 
   const placed = await call(
-    callbackUpdate(buyerId, reviewed.vodafoneButton!.callback_data!),
+    callbackUpdate(
+      buyerId,
+      reviewed.vodafoneButton!.callback_data!,
+      reviewed.reviewMessage!.messageId,
+    ),
     reviewed.transport,
   );
   expect(placed.status).toBe(200);
@@ -462,7 +523,9 @@ async function placeVodafoneOrderWithoutPrompt(
   expect(referenceButton?.callback_data).toBeDefined();
 
   return {
-    orderId: referenceButton!.callback_data!.slice(3),
+    orderId: withoutScreenRevision(
+      referenceButton!.callback_data!,
+    ).slice(3),
     instructions,
     instructionsMessageId: instructionsMessageId!,
     transport: placed.transport,
@@ -573,7 +636,7 @@ describe.skipIf(!shouldRun)("Vodafone Cash managed Telegram journey", () => {
       first.transport,
     );
     expect(storeDisabledReply.status).toBe(200);
-    expect(lastSentText(storeDisabledReply.transport)).toContain(
+    expect(lastText(storeDisabledReply.transport)).toContain(
       "Awaiting merchant verification",
     );
     expect(await claimFor(first.orderId)).toMatchObject({
@@ -599,7 +662,7 @@ describe.skipIf(!shouldRun)("Vodafone Cash managed Telegram journey", () => {
       second.transport,
     );
     expect(deploymentDisabledReply.status).toBe(200);
-    expect(lastSentText(deploymentDisabledReply.transport)).toContain(
+    expect(lastText(deploymentDisabledReply.transport)).toContain(
       "Awaiting merchant verification",
     );
     expect(await claimFor(second.orderId)).toMatchObject({
@@ -643,7 +706,7 @@ describe.skipIf(!shouldRun)("Vodafone Cash managed Telegram journey", () => {
     );
 
     expect(instructionsReply.status).toBe(200);
-    expect(lastSentText(instructionsReply.transport)).toContain(
+    expect(lastText(instructionsReply.transport)).toContain(
       "Welcome to Vodafone Bot Store.",
     );
     expect(await claimFor(placed.orderId)).toBeUndefined();
@@ -691,7 +754,10 @@ describe.skipIf(!shouldRun)("Vodafone Cash managed Telegram journey", () => {
     );
     expect(
       lastMessageButtons(arabic.transport).some(
-        (button) => button.callback_data === `tr:${placed.orderId}`,
+        (button) =>
+          button.callback_data !== undefined &&
+          withoutScreenRevision(button.callback_data) ===
+            `tr:${placed.orderId}`,
       ),
     ).toBe(true);
 
@@ -726,7 +792,10 @@ describe.skipIf(!shouldRun)("Vodafone Cash managed Telegram journey", () => {
     );
     expect(
       lastMessageButtons(english.transport).some(
-        (button) => button.callback_data === `tr:${placed.orderId}`,
+        (button) =>
+          button.callback_data !== undefined &&
+          withoutScreenRevision(button.callback_data) ===
+            `tr:${placed.orderId}`,
       ),
     ).toBe(true);
     expect(await claimFor(placed.orderId)).toBeUndefined();
@@ -740,7 +809,9 @@ describe.skipIf(!shouldRun)("Vodafone Cash managed Telegram journey", () => {
 
     // Cart then Home overwrites the only instructions message.
     const cartButton = lastMessageButtons(second.transport).find(
-      (button) => button.callback_data === "cart",
+      (button) =>
+        button.callback_data !== undefined &&
+        withoutScreenRevision(button.callback_data) === "cart",
     );
     expect(cartButton?.callback_data).toBeDefined();
     const cart = await call(
@@ -749,7 +820,9 @@ describe.skipIf(!shouldRun)("Vodafone Cash managed Telegram journey", () => {
     );
     const homeButton = lastMessageButtons(cart.transport).find(
       (button) =>
-        button.callback_data === "home" || button.callback_data === "home:new",
+        button.callback_data !== undefined &&
+        (withoutScreenRevision(button.callback_data) === "home" ||
+          withoutScreenRevision(button.callback_data) === "home:new"),
     );
     expect(homeButton?.callback_data).toBeDefined();
     const home = await call(
@@ -762,7 +835,9 @@ describe.skipIf(!shouldRun)("Vodafone Cash managed Telegram journey", () => {
     );
 
     const recoveryButton = lastMessageButtons(home.transport).find(
-      (button) => button.callback_data === "tfl",
+      (button) =>
+        button.callback_data !== undefined &&
+        withoutScreenRevision(button.callback_data) === "tfl",
     );
     expect(recoveryButton?.callback_data).toBeDefined();
 
@@ -783,7 +858,10 @@ describe.skipIf(!shouldRun)("Vodafone Cash managed Telegram journey", () => {
     ).toBe(true);
 
     const firstOrderButton = lastMessageButtons(list.transport).find(
-      (button) => button.callback_data === `tfo:${first.orderId}`,
+      (button) =>
+        button.callback_data !== undefined &&
+        withoutScreenRevision(button.callback_data) ===
+          `tfo:${first.orderId}`,
     );
     expect(firstOrderButton?.callback_data).toBeDefined();
     const reopened = await call(
@@ -798,7 +876,10 @@ describe.skipIf(!shouldRun)("Vodafone Cash managed Telegram journey", () => {
     expect(lastText(reopened.transport)).not.toContain(secondReference);
     expect(
       lastMessageButtons(reopened.transport).some(
-        (button) => button.callback_data === `tr:${first.orderId}`,
+        (button) =>
+          button.callback_data !== undefined &&
+          withoutScreenRevision(button.callback_data) ===
+            `tr:${first.orderId}`,
       ),
     ).toBe(true);
 
@@ -809,7 +890,7 @@ describe.skipIf(!shouldRun)("Vodafone Cash managed Telegram journey", () => {
       "RECOVERY-CLAIM-REF",
       reopened.transport,
     );
-    expect(lastSentText(claim.transport)).toContain(
+    expect(lastText(claim.transport)).toContain(
       "Awaiting merchant verification",
     );
     const submitted = await call(
@@ -846,8 +927,10 @@ describe.skipIf(!shouldRun)("Vodafone Cash managed Telegram journey", () => {
     // /start still surfaces the remaining outstanding order.
     const start = await call(messageUpdate(BUYER_A, "/start"), verified.transport);
     expect(
-      lastSentButtons(start.transport).some(
-        (button) => button.callback_data === "tfl",
+      lastMessageButtons(start.transport).some(
+        (button) =>
+        button.callback_data !== undefined &&
+        withoutScreenRevision(button.callback_data) === "tfl",
       ),
     ).toBe(true);
   });
@@ -859,8 +942,10 @@ describe.skipIf(!shouldRun)("Vodafone Cash managed Telegram journey", () => {
       placed.transport,
     );
     expect(
-      lastSentButtons(buyerBStart.transport).some(
-        (button) => button.callback_data === "tfl",
+      lastMessageButtons(buyerBStart.transport).some(
+        (button) =>
+        button.callback_data !== undefined &&
+        withoutScreenRevision(button.callback_data) === "tfl",
       ),
     ).toBe(false);
 
@@ -894,8 +979,10 @@ describe.skipIf(!shouldRun)("Vodafone Cash managed Telegram journey", () => {
       .where(eq(storeCommerceSetting.storeId, fixture.storeId));
 
     const start = await call(messageUpdate(BUYER_A, "/start"), placed.transport);
-    const recoveryButton = lastSentButtons(start.transport).find(
-      (button) => button.callback_data === "tfl",
+    const recoveryButton = lastMessageButtons(start.transport).find(
+      (button) =>
+        button.callback_data !== undefined &&
+        withoutScreenRevision(button.callback_data) === "tfl",
     );
     expect(recoveryButton?.callback_data).toBeDefined();
 
@@ -909,7 +996,10 @@ describe.skipIf(!shouldRun)("Vodafone Cash managed Telegram journey", () => {
       ),
     ).toBe(true);
     const orderButton = lastMessageButtons(list.transport).find(
-      (button) => button.callback_data === `tfo:${placed.orderId}`,
+      (button) =>
+        button.callback_data !== undefined &&
+        withoutScreenRevision(button.callback_data) ===
+          `tfo:${placed.orderId}`,
     );
     expect(orderButton?.callback_data).toBeDefined();
     const reopened = await call(
@@ -919,7 +1009,10 @@ describe.skipIf(!shouldRun)("Vodafone Cash managed Telegram journey", () => {
     expect(lastText(reopened.transport)).toContain(reference);
     expect(
       lastMessageButtons(reopened.transport).some(
-        (button) => button.callback_data === `tr:${placed.orderId}`,
+        (button) =>
+          button.callback_data !== undefined &&
+          withoutScreenRevision(button.callback_data) ===
+            `tr:${placed.orderId}`,
       ),
     ).toBe(true);
   });
@@ -934,7 +1027,7 @@ describe.skipIf(!shouldRun)("Vodafone Cash managed Telegram journey", () => {
       "SECOND-ORDER-REF",
       second.transport,
     );
-    expect(lastSentText(secondReply.transport)).toContain(
+    expect(lastText(secondReply.transport)).toContain(
       "Awaiting merchant verification",
     );
 
@@ -944,7 +1037,7 @@ describe.skipIf(!shouldRun)("Vodafone Cash managed Telegram journey", () => {
       "FIRST-ORDER-REF",
       first.transport,
     );
-    expect(lastSentText(firstReply.transport)).toContain(
+    expect(lastText(firstReply.transport)).toContain(
       "Awaiting merchant verification",
     );
 
@@ -961,7 +1054,7 @@ describe.skipIf(!shouldRun)("Vodafone Cash managed Telegram journey", () => {
       "FIRST-ORDER-REF",
       first.transport,
     );
-    expect(lastSentText(repeated.transport)).toContain(
+    expect(lastText(repeated.transport)).toContain(
       "Awaiting merchant verification",
     );
     expect(await claimFor(first.orderId)).toMatchObject({
@@ -1020,4 +1113,140 @@ describe.skipIf(!shouldRun)("Vodafone Cash managed Telegram journey", () => {
         .where(eq(inventoryReservation.orderId, first.orderId)),
     ).toMatchObject([{ status: "released" }]);
   });
+  it("does not place a new Vodafone order from a retired review confirmation", async () => {
+    const reviewed = await reviewCart(BUYER_A);
+    const vodafoneButton = reviewed.vodafoneButton!;
+    const reviewId = reviewed.reviewMessage!.messageId;
+
+    await call(messageUpdate(BUYER_A, "/start"), reviewed.transport);
+
+    const staleTransport = createFakeTelegramTransport();
+    const stale = await call(
+      callbackUpdate(BUYER_A, vodafoneButton.callback_data!, reviewId),
+      staleTransport,
+    );
+    expect(stale.status).toBe(200);
+    expect(stale.transport.answeredCallbacks.at(-1)?.text).toContain(
+      "no longer active",
+    );
+    expect(stale.transport.sentMessages).toHaveLength(0);
+    expect(stale.transport.editedMessages).toHaveLength(0);
+    expect(await db().select().from(order)).toHaveLength(0);
+    expect(await db().select().from(inventoryReservation)).toHaveLength(0);
+    expect(await db().select().from(orderPaymentClaim)).toHaveLength(0);
+  });
+
+  it("does not place a Vodafone order when the active state is missing", async () => {
+    const reviewed = await reviewCart(BUYER_A);
+    const vodafoneButton = reviewed.vodafoneButton!;
+    const reviewId = reviewed.reviewMessage!.messageId;
+    await db()
+      .delete(telegramActiveStorefront)
+      .where(
+        and(
+          eq(telegramActiveStorefront.connectionId, fixture.connectionId),
+          eq(telegramActiveStorefront.telegramUserId, BUYER_A),
+          eq(telegramActiveStorefront.telegramChatId, BUYER_A),
+        ),
+      );
+
+    const transport = createFakeTelegramTransport();
+    const result = await call(
+      callbackUpdate(BUYER_A, vodafoneButton.callback_data!, reviewId),
+      transport,
+    );
+    expect(result.status).toBe(200);
+    expect(result.transport.answeredCallbacks.at(-1)?.text).toContain(
+      "This confirmation is no longer active",
+    );
+    expect(result.transport.sentMessages).toHaveLength(0);
+    expect(result.transport.editedMessages).toHaveLength(0);
+    expect(await db().select().from(order)).toHaveLength(0);
+    expect(await db().select().from(inventoryReservation)).toHaveLength(0);
+    expect(await db().select().from(orderPaymentClaim)).toHaveLength(0);
+  });
+
+  it("does not place a Vodafone order when the active-state read fails", async () => {
+    const reviewed = await reviewCart(BUYER_A);
+    const vodafoneButton = reviewed.vodafoneButton!;
+    const reviewId = reviewed.reviewMessage!.messageId;
+    const transport = createFakeTelegramTransport();
+    const result = await call(
+      callbackUpdate(BUYER_A, vodafoneButton.callback_data!, reviewId),
+      transport,
+      { db: activeReadFailingDb() },
+    );
+    expect(result.status).toBe(200);
+    expect(result.transport.answeredCallbacks.at(-1)?.text).toContain(
+      "This confirmation is no longer active",
+    );
+    expect(result.transport.sentMessages).toHaveLength(0);
+    expect(result.transport.editedMessages).toHaveLength(0);
+    expect(await db().select().from(order)).toHaveLength(0);
+    expect(await db().select().from(inventoryReservation)).toHaveLength(0);
+    expect(await db().select().from(orderPaymentClaim)).toHaveLength(0);
+  });
+
+  it("recovers an already placed Vodafone order from a retired confirmation without duplicating it", async () => {
+    const reviewed = await reviewCart(BUYER_A);
+    const vodafoneButton = reviewed.vodafoneButton!;
+    const reviewId = reviewed.reviewMessage!.messageId;
+
+    const placed = await call(
+      callbackUpdate(BUYER_A, vodafoneButton.callback_data!, reviewId),
+      reviewed.transport,
+    );
+    expect(placed.status).toBe(200);
+    const [orderRow] = await db().select().from(order);
+    expect(orderRow).toBeDefined();
+    expect(await db().select().from(inventoryReservation)).toHaveLength(1);
+
+    const home = await call(
+      messageUpdate(BUYER_A, "/start"),
+      placed.transport,
+    );
+    const activeKey = and(
+      eq(telegramActiveStorefront.connectionId, fixture.connectionId),
+      eq(telegramActiveStorefront.telegramUserId, BUYER_A),
+      eq(telegramActiveStorefront.telegramChatId, BUYER_A),
+    );
+    const [activeBefore] = await db()
+      .select()
+      .from(telegramActiveStorefront)
+      .where(activeKey);
+    const editedBefore = placed.transport.editedMessages.length;
+
+    const delayedUpdate = callbackUpdate(
+      BUYER_A,
+      vodafoneButton.callback_data!,
+      reviewId,
+    );
+    delayedUpdate.update_id = 1;
+    const recovered = await call(delayedUpdate, placed.transport);
+    expect(recovered.status).toBe(200);
+    expect(recovered.transport.answeredCallbacks.at(-1)?.text).toContain(
+      orderRow.reference,
+    );
+    expect(recovered.transport.editedMessages).toHaveLength(editedBefore);
+    expect(await db().select().from(order)).toHaveLength(1);
+    expect(await db().select().from(inventoryReservation)).toHaveLength(1);
+    expect(await db().select().from(orderPaymentClaim)).toHaveLength(0);
+    const [activeAfter] = await db()
+      .select()
+      .from(telegramActiveStorefront)
+      .where(activeKey);
+    expect(activeAfter).toEqual(activeBefore);
+
+    const currentButton = lastMessageButtons(home.transport).find((button) =>
+      button.callback_data?.startsWith("langs:"),
+    );
+    expect(currentButton?.callback_data).toBeDefined();
+    const current = await call(
+      callbackUpdate(BUYER_A, currentButton!.callback_data!, reviewId),
+      placed.transport,
+    );
+    expect(current.status).toBe(200);
+    expect(lastText(current.transport)).toContain("Choose your language");
+  });
+
 });
