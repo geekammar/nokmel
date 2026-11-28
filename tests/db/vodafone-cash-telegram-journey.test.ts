@@ -22,6 +22,7 @@ import type { TransactionDatabase } from "@/db/transaction-client";
 import { rejectVodafoneCashTransfer, verifyVodafoneCashTransfer } from "@/lib/commerce/orders";
 import { hashWebhookSecret } from "@/lib/telegram/connection-secrets";
 import { handleManagedTelegramWebhookRequest } from "@/lib/telegram/managed-webhook";
+import { withoutScreenRevision } from "@/lib/telegram/tokens";
 import {
   createFakeTelegramTransport,
   type FakeTelegramTransport,
@@ -183,7 +184,8 @@ beforeEach(async () => {
       "order",
       "cart_item",
       "cart",
-      "telegram_active_storefront"
+      "telegram_active_storefront",
+      "telegram_storefront_lock"
     restart identity cascade
   `);
 
@@ -389,7 +391,9 @@ async function reviewCart(
     transport: reviewed.transport,
     reviewMessage,
     vodafoneButton,
-    cartId: checkoutButton!.callback_data!.slice(3),
+    cartId: withoutScreenRevision(
+      checkoutButton!.callback_data!,
+    ).slice(3),
   };
 }
 
@@ -413,7 +417,9 @@ async function placeVodafoneOrder(
 
   const referenceButton = lastButton(placed.transport, "tr:");
   expect(referenceButton?.callback_data).toBeDefined();
-  const orderId = referenceButton!.callback_data!.slice(3);
+  const orderId = withoutScreenRevision(
+    referenceButton!.callback_data!,
+  ).slice(3);
 
   const prompt = await call(
     callbackUpdate(
@@ -460,7 +466,9 @@ async function placeVodafoneOrderWithoutPrompt(
   expect(referenceButton?.callback_data).toBeDefined();
 
   return {
-    orderId: referenceButton!.callback_data!.slice(3),
+    orderId: withoutScreenRevision(
+      referenceButton!.callback_data!,
+    ).slice(3),
     instructions,
     instructionsMessageId: instructionsMessageId!,
     transport: placed.transport,
@@ -689,7 +697,10 @@ describe.skipIf(!shouldRun)("Vodafone Cash managed Telegram journey", () => {
     );
     expect(
       lastMessageButtons(arabic.transport).some(
-        (button) => button.callback_data === `tr:${placed.orderId}`,
+        (button) =>
+          button.callback_data !== undefined &&
+          withoutScreenRevision(button.callback_data) ===
+            `tr:${placed.orderId}`,
       ),
     ).toBe(true);
 
@@ -724,7 +735,10 @@ describe.skipIf(!shouldRun)("Vodafone Cash managed Telegram journey", () => {
     );
     expect(
       lastMessageButtons(english.transport).some(
-        (button) => button.callback_data === `tr:${placed.orderId}`,
+        (button) =>
+          button.callback_data !== undefined &&
+          withoutScreenRevision(button.callback_data) ===
+            `tr:${placed.orderId}`,
       ),
     ).toBe(true);
     expect(await claimFor(placed.orderId)).toBeUndefined();
@@ -738,7 +752,9 @@ describe.skipIf(!shouldRun)("Vodafone Cash managed Telegram journey", () => {
 
     // Cart then Home overwrites the only instructions message.
     const cartButton = lastMessageButtons(second.transport).find(
-      (button) => button.callback_data === "cart",
+      (button) =>
+        button.callback_data !== undefined &&
+        withoutScreenRevision(button.callback_data) === "cart",
     );
     expect(cartButton?.callback_data).toBeDefined();
     const cart = await call(
@@ -747,7 +763,9 @@ describe.skipIf(!shouldRun)("Vodafone Cash managed Telegram journey", () => {
     );
     const homeButton = lastMessageButtons(cart.transport).find(
       (button) =>
-        button.callback_data === "home" || button.callback_data === "home:new",
+        button.callback_data !== undefined &&
+        (withoutScreenRevision(button.callback_data) === "home" ||
+          withoutScreenRevision(button.callback_data) === "home:new"),
     );
     expect(homeButton?.callback_data).toBeDefined();
     const home = await call(
@@ -760,7 +778,9 @@ describe.skipIf(!shouldRun)("Vodafone Cash managed Telegram journey", () => {
     );
 
     const recoveryButton = lastMessageButtons(home.transport).find(
-      (button) => button.callback_data === "tfl",
+      (button) =>
+        button.callback_data !== undefined &&
+        withoutScreenRevision(button.callback_data) === "tfl",
     );
     expect(recoveryButton?.callback_data).toBeDefined();
 
@@ -781,7 +801,10 @@ describe.skipIf(!shouldRun)("Vodafone Cash managed Telegram journey", () => {
     ).toBe(true);
 
     const firstOrderButton = lastMessageButtons(list.transport).find(
-      (button) => button.callback_data === `tfo:${first.orderId}`,
+      (button) =>
+        button.callback_data !== undefined &&
+        withoutScreenRevision(button.callback_data) ===
+          `tfo:${first.orderId}`,
     );
     expect(firstOrderButton?.callback_data).toBeDefined();
     const reopened = await call(
@@ -796,7 +819,10 @@ describe.skipIf(!shouldRun)("Vodafone Cash managed Telegram journey", () => {
     expect(lastText(reopened.transport)).not.toContain(secondReference);
     expect(
       lastMessageButtons(reopened.transport).some(
-        (button) => button.callback_data === `tr:${first.orderId}`,
+        (button) =>
+          button.callback_data !== undefined &&
+          withoutScreenRevision(button.callback_data) ===
+            `tr:${first.orderId}`,
       ),
     ).toBe(true);
 
@@ -845,7 +871,9 @@ describe.skipIf(!shouldRun)("Vodafone Cash managed Telegram journey", () => {
     const start = await call(messageUpdate(BUYER_A, "/start"), verified.transport);
     expect(
       lastMessageButtons(start.transport).some(
-        (button) => button.callback_data === "tfl",
+        (button) =>
+        button.callback_data !== undefined &&
+        withoutScreenRevision(button.callback_data) === "tfl",
       ),
     ).toBe(true);
   });
@@ -858,7 +886,9 @@ describe.skipIf(!shouldRun)("Vodafone Cash managed Telegram journey", () => {
     );
     expect(
       lastMessageButtons(buyerBStart.transport).some(
-        (button) => button.callback_data === "tfl",
+        (button) =>
+        button.callback_data !== undefined &&
+        withoutScreenRevision(button.callback_data) === "tfl",
       ),
     ).toBe(false);
 
@@ -893,7 +923,9 @@ describe.skipIf(!shouldRun)("Vodafone Cash managed Telegram journey", () => {
 
     const start = await call(messageUpdate(BUYER_A, "/start"), placed.transport);
     const recoveryButton = lastMessageButtons(start.transport).find(
-      (button) => button.callback_data === "tfl",
+      (button) =>
+        button.callback_data !== undefined &&
+        withoutScreenRevision(button.callback_data) === "tfl",
     );
     expect(recoveryButton?.callback_data).toBeDefined();
 
@@ -907,7 +939,10 @@ describe.skipIf(!shouldRun)("Vodafone Cash managed Telegram journey", () => {
       ),
     ).toBe(true);
     const orderButton = lastMessageButtons(list.transport).find(
-      (button) => button.callback_data === `tfo:${placed.orderId}`,
+      (button) =>
+        button.callback_data !== undefined &&
+        withoutScreenRevision(button.callback_data) ===
+          `tfo:${placed.orderId}`,
     );
     expect(orderButton?.callback_data).toBeDefined();
     const reopened = await call(
@@ -917,7 +952,10 @@ describe.skipIf(!shouldRun)("Vodafone Cash managed Telegram journey", () => {
     expect(lastText(reopened.transport)).toContain(reference);
     expect(
       lastMessageButtons(reopened.transport).some(
-        (button) => button.callback_data === `tr:${placed.orderId}`,
+        (button) =>
+          button.callback_data !== undefined &&
+          withoutScreenRevision(button.callback_data) ===
+            `tr:${placed.orderId}`,
       ),
     ).toBe(true);
   });

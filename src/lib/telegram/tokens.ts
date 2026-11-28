@@ -12,6 +12,8 @@ export const UUID_REGEX =
 export const LANG_CODE_REGEX = /^[a-z]{2}$/;
 export const PAGE_REGEX = /^[1-9][0-9]{0,4}$/;
 export const NAVIGATION_TOKEN_REGEX = /^[A-Za-z0-9_-]{12}$/;
+const SCREEN_REVISION_PATTERN = /^[0-9a-z]{1,3}$/;
+const SCREEN_REVISION_MODULUS = 46_656;
 const LANGUAGE_CONTEXT_PATTERN =
   /^(?:h|cod|p:[1-9][0-9]{0,4}|cs|c:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?::[1-9][0-9]{0,4})?|pd:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?::[A-Za-z0-9_-]{12})?|to:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
 
@@ -27,6 +29,37 @@ function assertLanguageContext(context: string | undefined): string | null {
   return context;
 }
 
+export function withScreenRevision(data: string, revision: number): string {
+  if (!Number.isInteger(revision) || revision < 1) {
+    throw new Error(`Invalid screen revision: ${revision}`);
+  }
+  const encoded = (revision % SCREEN_REVISION_MODULUS).toString(36);
+  return assertValidCallbackData(`${data}~${encoded}`);
+}
+
+export function withoutScreenRevision(data: string): string {
+  return stripScreenRevision(data) ?? data;
+}
+
+export function screenRevisionFromData(data?: string): number | null {
+  if (typeof data !== "string") return null;
+  const separator = data.lastIndexOf("~");
+  if (separator === -1) return null;
+  const encoded = data.slice(separator + 1);
+  return SCREEN_REVISION_PATTERN.test(encoded)
+    ? parseInt(encoded, 36)
+    : null;
+}
+
+function stripScreenRevision(data: string): string | null {
+  const separator = data.lastIndexOf("~");
+  if (separator === -1) return data;
+  const encoded = data.slice(separator + 1);
+  if (!SCREEN_REVISION_PATTERN.test(encoded)) return null;
+  const base = data.slice(0, separator);
+  return base.length > 0 ? base : null;
+}
+
 export function assertValidCallbackData(data: string): string {
   const byteLen = Buffer.byteLength(data, "utf8");
   if (byteLen < 1 || byteLen > TELEGRAM_MAX_CALLBACK_DATA_BYTES) {
@@ -40,6 +73,7 @@ export function assertValidCallbackData(data: string): string {
 export const tokens = {
   home: (): string => assertValidCallbackData("home"),
   homeNew: (): string => assertValidCallbackData("home:new"),
+  receiptHome: (): string => assertValidCallbackData("home:receipt"),
   catalogSearch: (): string => assertValidCallbackData("catalog-search"),
   catalogSearchPage: (page: number): string => {
     if (!PAGE_REGEX.test(String(page))) throw new Error(`Invalid page number: ${page}`);
@@ -245,6 +279,7 @@ export const tokens = {
 export type ParsedToken =
   | { type: "home" }
   | { type: "homeNew" }
+  | { type: "receiptHome" }
   | { type: "catalogSearch" }
   | { type: "catalogSearchPage"; page: number }
   | { type: "latestCodOrder" }
@@ -284,6 +319,12 @@ export function parseToken(data?: string): ParsedToken {
     return { type: "unknown", raw: "" };
   }
 
+  const stripped = stripScreenRevision(data);
+  if (stripped === null) {
+    return { type: "unknown", raw: data };
+  }
+  data = stripped;
+
   const byteLen = Buffer.byteLength(data, "utf8");
   if (byteLen < 1 || byteLen > TELEGRAM_MAX_CALLBACK_DATA_BYTES) {
     return { type: "unknown", raw: data };
@@ -295,6 +336,10 @@ export function parseToken(data?: string): ParsedToken {
 
   if (data === "home:new") {
     return { type: "homeNew" };
+  }
+
+  if (data === "home:receipt") {
+    return { type: "receiptHome" };
   }
 
   if (data === "catalog-search") return { type: "catalogSearch" };

@@ -3,8 +3,11 @@ import { describe, expect, it } from "vitest";
 import {
   assertValidCallbackData,
   parseToken,
+  screenRevisionFromData,
   TELEGRAM_MAX_CALLBACK_DATA_BYTES,
   tokens,
+  withScreenRevision,
+  withoutScreenRevision,
 } from "@/lib/telegram/tokens";
 
 describe("telegram tokens", () => {
@@ -431,4 +434,32 @@ describe("telegram tokens", () => {
     const overlength = "c:" + "a".repeat(70);
     expect(parseToken(overlength)).toEqual({ type: "unknown", raw: overlength });
   });
+  it("binds screen revisions without changing the parsed action", () => {
+    expect(tokens.receiptHome()).toBe("home:receipt");
+    expect(parseToken(tokens.receiptHome())).toEqual({ type: "receiptHome" });
+
+    const bound = withScreenRevision(tokens.products(2), 1234);
+    expect(bound).toBe("prods:2~ya");
+    expect(screenRevisionFromData(bound)).toBe(1234);
+    expect(withoutScreenRevision(bound)).toBe("prods:2");
+    expect(parseToken(bound)).toEqual({ type: "products", page: 2 });
+    expect(parseToken("prods:2~bad!")).toEqual({
+      type: "unknown",
+      raw: "prods:2~bad!",
+    });
+
+    // The longest storefront language callback stays within Telegram's limit.
+    const languageContext = `lang:ar:pd:${uuid}:${navToken}`;
+    const longest = withScreenRevision(languageContext, 46_655);
+    expect(Buffer.byteLength(longest, "utf8")).toBeLessThanOrEqual(
+      TELEGRAM_MAX_CALLBACK_DATA_BYTES,
+    );
+    expect(screenRevisionFromData(longest)).toBe(46_655 % 46_656);
+    expect(parseToken(longest)).toEqual({
+      type: "lang",
+      code: "ar",
+      context: `pd:${uuid}:${navToken}`,
+    });
+  });
+
 });

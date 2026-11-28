@@ -84,10 +84,13 @@ import {
   isBuyerLocale,
 } from "@/lib/commerce/buyer-language";
 import {
+  acquireStorefrontLock,
   adoptActiveStorefront,
   readActiveStorefront,
   recordActiveStorefront,
+  releaseStorefrontLock,
   setActiveStorefrontInputMode,
+  StorefrontScopeBusyError,
   type ActiveStorefront,
   type ActiveStorefrontBinding,
 } from "./active-storefront";
@@ -100,8 +103,10 @@ import {
 } from "./navigation-context";
 import {
   isNavigationToken,
+  screenRevisionFromData,
   tokens,
   UUID_REGEX,
+  withScreenRevision,
   type ParsedToken,
 } from "./tokens";
 import { telegramSupportChatUrl } from "./support-contact";
@@ -145,6 +150,7 @@ type StorefrontLifecycle = {
   updateId: number;
   active: ActiveStorefront | null;
   route: TelegramStorefrontRoute;
+  screenRevision: number;
 };
 
 const STOREFRONT_LIFECYCLE = Symbol("storefrontLifecycle");
@@ -176,6 +182,32 @@ function setStorefrontRoute(
 ): void {
   const lifecycle = storefrontLifecycle(transport);
   if (lifecycle) lifecycle.route = route;
+}
+
+function bindScreenRevision(
+  transport: TelegramTransport,
+  replyMarkup: Parameters<TelegramTransport["sendMessage"]>[0]["replyMarkup"],
+): Parameters<TelegramTransport["sendMessage"]>[0]["replyMarkup"] {
+  const lifecycle = storefrontLifecycle(transport);
+  if (!lifecycle || !replyMarkup || !("inline_keyboard" in replyMarkup)) {
+    return replyMarkup;
+  }
+
+  return {
+    inline_keyboard: replyMarkup.inline_keyboard.map((row) =>
+      row.map((button) =>
+        button.callback_data
+          ? {
+              ...button,
+              callback_data: withScreenRevision(
+                button.callback_data,
+                lifecycle.screenRevision,
+              ),
+            }
+          : button,
+      ),
+    ),
+  };
 }
 
 function logActiveStorefrontFailure(
@@ -213,6 +245,7 @@ async function recordActiveStorefrontSafely(
       messageId,
       hasMedia,
       route: lifecycle.route,
+      revision: lifecycle.screenRevision,
       updateId: lifecycle.updateId,
     });
   } catch (error) {
@@ -243,6 +276,7 @@ async function adoptActiveStorefrontSafely(
 async function setStorefrontInputMode(
   transport: TelegramTransport,
   inputMode: TelegramStorefrontInputMode,
+  promptMessageId: number | null = null,
 ): Promise<void> {
   const lifecycle = storefrontLifecycle(transport);
   if (!lifecycle) return;
@@ -253,6 +287,7 @@ async function setStorefrontInputMode(
       lifecycle.binding,
       {
         inputMode,
+        promptMessageId,
         updateId: lifecycle.updateId,
       },
     );
@@ -753,8 +788,8 @@ async function sendPhonePrompt(
   chatId: number,
   cart: CartView,
   copy: CommerceCopy,
-): Promise<void> {
-  await sendOrThrow(transport, {
+): Promise<number | null> {
+  const result = await transport.sendMessage({
     chatId,
     text: [
       copy.checkout,
@@ -778,7 +813,14 @@ async function sendPhonePrompt(
       one_time_keyboard: true,
     },
   });
-  await setStorefrontInputMode(transport, "phone");
+
+  if (!result.ok) {
+    throw new Error(result.error ?? "Telegram send failed");
+  }
+
+  const promptMessageId = result.messageId ?? null;
+  await setStorefrontInputMode(transport, "phone", promptMessageId);
+  return promptMessageId;
 }
 
 async function sendAddressPrompt(
@@ -786,8 +828,8 @@ async function sendAddressPrompt(
   chatId: number,
   copy: CommerceCopy,
   text = copy.addressPrompt,
-): Promise<void> {
-  await sendOrThrow(transport, {
+): Promise<number | null> {
+  const result = await transport.sendMessage({
     chatId,
     text,
     replyMarkup: {
@@ -800,7 +842,14 @@ async function sendAddressPrompt(
       resize_keyboard: true,
     },
   });
-  await setStorefrontInputMode(transport, "address");
+
+  if (!result.ok) {
+    throw new Error(result.error ?? "Telegram send failed");
+  }
+
+  const promptMessageId = result.messageId ?? null;
+  await setStorefrontInputMode(transport, "address", promptMessageId);
+  return promptMessageId;
 }
 
 type PlacedOrderReceipt = {
@@ -825,6 +874,14 @@ function placedOrderText(result: PlacedOrderReceipt, copy: CommerceCopy): string
 }
 
 function placedOrderKeyboard(copy: CommerceCopy) {
+  return {
+    inline_keyboard: [
+      [{ text: copy.home, callback_data: tokens.receiptHome() }],
+    ],
+  };
+}
+
+function bridgeOrderKeyboard(copy: CommerceCopy) {
   return {
     inline_keyboard: [
       [{ text: copy.home, callback_data: tokens.homeNew() }],
@@ -863,7 +920,7 @@ async function renderPlacedOrderBridge(
     chatId,
     messageId,
     text: `${copy.orderPlaced(result.reference)}\n\n${copy.reservedNote}`,
-    replyMarkup: placedOrderKeyboard(copy),
+    replyMarkup: bridgeOrderKeyboard(copy),
   });
 }
 
@@ -881,7 +938,7 @@ async function renderPlacedOrderOnActiveMessage(
     chatId,
     messageId,
     text: placedOrderText(result, copy),
-    replyMarkup: placedOrderKeyboard(copy),
+    replyMarkup: bridgeOrderKeyboard(copy),
   };
 
   if (allowReplacementSend) {
@@ -1044,8 +1101,13 @@ async function sendTransferReferencePrompt(
     throw new Error(result.error ?? "Telegram send failed");
   }
 
-  await setStorefrontInputMode(transport, "transfer_reference");
-  return result.messageId ?? null;
+  const promptMessageId = result.messageId ?? null;
+  await setStorefrontInputMode(
+    transport,
+    "transfer_reference",
+    promptMessageId,
+  );
+  return promptMessageId;
 }
 
 function transferStateText(
@@ -1180,7 +1242,10 @@ async function sendActiveOrThrow(
   transport: TelegramTransport,
   params: Parameters<TelegramTransport["sendMessage"]>[0],
 ): Promise<void> {
-  const result = await transport.sendMessage(params);
+  const result = await transport.sendMessage({
+    ...params,
+    replyMarkup: bindScreenRevision(transport, params.replyMarkup),
+  });
   if (!result.ok) {
     throw new Error(result.error ?? "Telegram send failed");
   }
@@ -1194,7 +1259,11 @@ async function editOrThrow(
   transport: TelegramTransport,
   params: Parameters<TelegramTransport["editMessageText"]>[0],
 ): Promise<void> {
-  const result = await transport.editMessageText(params);
+  const replyMarkup = bindScreenRevision(
+    transport,
+    params.replyMarkup,
+  ) as typeof params.replyMarkup;
+  const result = await transport.editMessageText({ ...params, replyMarkup });
 
   if (result.ok) {
     await recordActiveStorefrontSafely(
@@ -1213,7 +1282,7 @@ async function editOrThrow(
     const sent = await transport.sendMessage({
       chatId: params.chatId,
       text: params.text,
-      replyMarkup: params.replyMarkup,
+      replyMarkup,
     });
 
     if (!sent.ok) {
@@ -1240,7 +1309,11 @@ async function editOnlyOrThrow(
   transport: TelegramTransport,
   params: Parameters<TelegramTransport["editMessageText"]>[0],
 ): Promise<void> {
-  const result = await transport.editMessageText(params);
+  const replyMarkup = bindScreenRevision(
+    transport,
+    params.replyMarkup,
+  ) as typeof params.replyMarkup;
+  const result = await transport.editMessageText({ ...params, replyMarkup });
   if (!result.ok) {
     throw new Error(result.error ?? "Telegram edit failed");
   }
@@ -1452,7 +1525,15 @@ async function renderHome(
   }
 
   if (photo && text.length <= TELEGRAM_MAX_CAPTION_CHARS) {
-    const result = await transport.sendPhoto({ chatId, photo, caption: text, replyMarkup });
+    const result = await transport.sendPhoto({
+      chatId,
+      photo,
+      caption: text,
+      replyMarkup: bindScreenRevision(
+        transport,
+        replyMarkup,
+      ) as typeof replyMarkup,
+    });
     if (result.ok) {
       if (result.messageId !== undefined) {
         await recordActiveStorefrontSafely(transport, result.messageId, true);
@@ -1539,13 +1620,20 @@ async function sendCatalogSearchPrompt(
   chatId: number,
   copy: CommerceCopy,
   invalid = false,
-): Promise<void> {
-  await sendOrThrow(transport, {
+): Promise<number | null> {
+  const result = await transport.sendMessage({
     chatId,
     text: invalid ? `${copy.searchInvalid}\n\n${copy.searchPrompt}` : copy.searchPrompt,
     replyMarkup: { force_reply: true },
   });
-  await setStorefrontInputMode(transport, "search");
+
+  if (!result.ok) {
+    throw new Error(result.error ?? "Telegram send failed");
+  }
+
+  const promptMessageId = result.messageId ?? null;
+  await setStorefrontInputMode(transport, "search", promptMessageId);
+  return promptMessageId;
 }
 
 async function renderCatalogSearch(
@@ -1781,6 +1869,11 @@ async function renderStorefrontCard(
   text: string,
   replyMarkup: { inline_keyboard: TelegramInlineKeyboardButton[][] },
 ): Promise<void> {
+  const boundReplyMarkup = bindScreenRevision(
+    transport,
+    replyMarkup,
+  ) as typeof replyMarkup;
+
   // Captions are shorter than regular messages. A card that cannot fit keeps
   // the complete, usable text path instead of truncating merchant content.
   if (imageUrl && text.length <= TELEGRAM_MAX_CAPTION_CHARS) {
@@ -1789,7 +1882,7 @@ async function renderStorefrontCard(
         chatId,
         messageId,
         media: { type: "photo", media: imageUrl, caption: text },
-        replyMarkup,
+        replyMarkup: boundReplyMarkup,
       });
 
       if (edited.ok) {
@@ -1812,7 +1905,7 @@ async function renderStorefrontCard(
         chatId,
         photo: imageUrl,
         caption: text,
-        replyMarkup,
+        replyMarkup: boundReplyMarkup,
       });
 
       if (sent.ok) {
@@ -2209,8 +2302,13 @@ async function dispatchMessage(
       updateId,
       active,
       route: active?.route ?? "storefront",
+      screenRevision: (active?.revision ?? 0) + 1,
     });
   }
+  // Message inputs follow the same ordering as callbacks. A delayed reply
+  // cannot be consumed after a newer screen or prompt has advanced the scope.
+  if (active !== null && active.lastUpdateId > updateId) return;
+
   const activeMessageId = active?.messageId;
   const activeMessageHasMedia = active?.hasMedia ?? false;
   const context = await languageContextFor(
@@ -2276,6 +2374,15 @@ async function dispatchMessage(
   const reply = message.reply_to_message;
   if (reply?.from?.id === botId && reply.from.is_bot === true &&
       reply.chat?.id === message.chat.id && matchesSearchPrompt(reply.text)) {
+    // The reply must belong to the currently pending search prompt. An older
+    // search prompt reply is ignored rather than replacing a newer screen or
+    // being consumed as phone/address checkout input.
+    const pendingSearch =
+      active?.inputMode === "search" &&
+      (active.inputPromptMessageId === null ||
+        active.inputPromptMessageId === reply.message_id);
+    if (!pendingSearch) return;
+
     const query = managedSearchQuery(text);
     if (query) {
       await renderCatalogSearch(
@@ -2328,6 +2435,13 @@ async function dispatchMessage(
 
     if (activeCart?.status === "checkout") {
       if (activeCart.checkoutState === "awaiting_phone") {
+        if (
+          active &&
+          active.inputMode !== "none" &&
+          active.inputMode !== "phone"
+        ) {
+          return;
+        }
         const contact = message.contact;
 
         if (
@@ -2366,6 +2480,13 @@ async function dispatchMessage(
       }
 
       if (activeCart.checkoutState === "awaiting_address") {
+        if (
+          active &&
+          active.inputMode !== "none" &&
+          active.inputMode !== "address"
+        ) {
+          return;
+        }
         const result = await saveAddressAndPrepareReview(commerceDb, scope, {
           cartId: activeCart.id,
           connectionId,
@@ -2432,6 +2553,16 @@ async function dispatchMessage(
     const promptMessageId = repliedMessageId(message);
 
     if (promptMessageId !== null) {
+      if (
+        active &&
+        active.inputMode !== "none" &&
+        (active.inputMode !== "transfer_reference" ||
+          (active.inputPromptMessageId !== null &&
+            active.inputPromptMessageId !== promptMessageId))
+      ) {
+        return;
+      }
+
       const state = await readVodafoneCashOrderByPromptReply(
         commerceDb,
         scope,
@@ -2820,6 +2951,7 @@ async function dispatchCallback(
   transport: TelegramTransport,
   callbackQuery: {
     id: string;
+    data?: string;
     message?: TelegramMessage;
     from: { id: number; first_name?: string; language_code?: string };
   },
@@ -2862,20 +2994,33 @@ async function dispatchCallback(
     updateId: updateAttempt.updateId,
     active,
     route: active?.route ?? "storefront",
+    screenRevision: (active?.revision ?? 0) + 1,
   });
 
-  // Confirmation replays are idempotent commerce operations and a fresh home
-  // action intentionally starts a new message while keeping the receipt. All
-  // other callbacks from an older message are retired screens and must not
-  // render over the current one or repeat a cart/checkout mutation.
-  const staleReplayAllowed =
-    parsedToken.type === "homeNew" ||
+  const callbackRevision = screenRevisionFromData(callbackQuery.data);
+  const receiptHome = parsedToken.type === "receiptHome";
+  const confirmationReplay =
     parsedToken.type === "confirmCod" ||
     parsedToken.type === "confirmVodafoneCash";
+
+  // Confirmation replays are idempotent commerce operations and receipt Home
+  // is independent of the storefront. Every other callback is bound to the
+  // current screen revision, so a button from an earlier rendering of the same
+  // message cannot act after that screen was replaced.
+  const revisionMismatch =
+    active !== null &&
+    !receiptHome &&
+    !confirmationReplay &&
+    callbackRevision !== null &&
+    callbackRevision !== active.revision;
+
   const stale =
+    !receiptHome &&
+    !confirmationReplay &&
     active !== null &&
     (active.lastUpdateId > updateAttempt.updateId ||
-      (callbackMessageId < active.messageId && !staleReplayAllowed));
+      callbackMessageId < active.messageId ||
+      revisionMismatch);
 
   const ack = await transport.answerCallbackQuery({
     callbackQueryId: callbackQuery.id,
@@ -2889,7 +3034,10 @@ async function dispatchCallback(
   if (stale) {
     // The keyboard clear may have failed earlier; validate the callback here
     // and retire the old controls if Telegram still permits it.
-    if (callbackMessageId !== active.messageId) {
+    if (
+      callbackMessageId !== active.messageId &&
+      parsedToken.type !== "homeNew"
+    ) {
       await clearMessageKeyboard(transport, chatId, callbackMessageId);
     }
     return;
@@ -2898,7 +3046,10 @@ async function dispatchCallback(
   let targetMessageId: number | undefined = callbackMessageId;
   let targetHasMedia = messageHasPhoto(message);
 
-  if (parsedToken.type === "homeNew") {
+  if (receiptHome) {
+    targetMessageId = active?.messageId;
+    targetHasMedia = active?.hasMedia ?? false;
+  } else if (parsedToken.type === "homeNew") {
     targetMessageId = undefined;
   } else if (active) {
     if (callbackMessageId <= active.messageId) {
@@ -2908,6 +3059,7 @@ async function dispatchCallback(
   }
 
   if (
+    !receiptHome &&
     parsedToken.type !== "homeNew" &&
     targetMessageId !== undefined &&
     (!active || targetMessageId !== active.messageId)
@@ -3621,6 +3773,33 @@ async function dispatchCallback(
     }
   }
 
+  if (parsedToken.type === "receiptHome") {
+    // A receipt is independent of the storefront. Reuse the active storefront
+    // when one exists; otherwise send the first one. Never edit or clear the
+    // receipt itself.
+    await renderHome(
+      db,
+      scope,
+      storeName,
+      cod,
+      copy,
+      plan,
+      transport,
+      chatId,
+      targetMessageId,
+      homeRecoveryFor(
+        commerceDb,
+        connectionId,
+        buyerId,
+        chatId,
+        context.language.locale,
+      ),
+      targetHasMedia,
+      navigation,
+    );
+    return;
+  }
+
   if (parsedToken.type === "homeNew") {
     await renderHome(
       db,
@@ -3843,6 +4022,8 @@ export async function handleManagedTelegramWebhookRequest(
     options?.deadline ?? new StandardExecutionDeadline(budgetMs, options?.now);
 
   let attemptToken: string | undefined;
+  let storefrontLockToken: string | undefined;
+  let storefrontBinding: ActiveStorefrontBinding | undefined;
 
   try {
     const claim = await claimManagedTelegramUpdate(db, {
@@ -3871,6 +4052,37 @@ export async function handleManagedTelegramWebhookRequest(
 
     attemptToken = claim.attemptToken;
     deadline.checkOrThrow();
+
+    const updateMessage =
+      validation.data.updateType === "message"
+        ? validation.data.message
+        : undefined;
+    const updateCallback =
+      validation.data.updateType === "callback_query"
+        ? validation.data.callbackQuery
+        : undefined;
+    const storefrontChatId =
+      updateMessage?.chat.id ?? updateCallback?.message?.chat.id;
+    const storefrontBuyerId =
+      updateMessage?.from?.id ?? updateCallback?.from.id;
+
+    if (storefrontChatId !== undefined && storefrontBuyerId !== undefined) {
+      storefrontBinding = {
+        storeId: connection.storeId,
+        connectionId: connection.id,
+        botId: connection.botId,
+        telegramUserId: storefrontBuyerId,
+        telegramChatId: storefrontChatId,
+      };
+
+      const acquired = await acquireStorefrontLock(
+        db,
+        storefrontBinding,
+        claim.attemptToken,
+      );
+      if (!acquired) throw new StorefrontScopeBusyError();
+      storefrontLockToken = claim.attemptToken;
+    }
 
     const scope = await createStoreScopeForExistingStore(
       db,
@@ -3968,6 +4180,19 @@ export async function handleManagedTelegramWebhookRequest(
       }
     }
 
+    if (error instanceof StorefrontScopeBusyError) {
+      return new Response(
+        JSON.stringify({ error: "Storefront update is busy" }),
+        {
+          status: 429,
+          headers: {
+            "Content-Type": "application/json",
+            "Retry-After": "5",
+          },
+        },
+      );
+    }
+
     if (
       diagnostic.category === "rate_limited" &&
       diagnostic.retryAfterSeconds !== undefined
@@ -3998,5 +4223,13 @@ export async function handleManagedTelegramWebhookRequest(
     }
 
     return json({ error: "Internal server error" }, 500);
+  } finally {
+    if (storefrontBinding && storefrontLockToken) {
+      try {
+        await releaseStorefrontLock(db, storefrontBinding, storefrontLockToken);
+      } catch {
+        // The lease expires on its own; release failure must not mask the result.
+      }
+    }
   }
 }

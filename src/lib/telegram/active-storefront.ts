@@ -5,6 +5,7 @@ import { and, eq, sql } from "drizzle-orm";
 import type { Database } from "@/db/client";
 import {
   telegramActiveStorefront,
+  telegramStorefrontLock,
   type TelegramStorefrontInputMode,
   type TelegramStorefrontRoute,
 } from "@/db/schema";
@@ -22,9 +23,19 @@ export type ActiveStorefront = {
   hasMedia: boolean;
   route: TelegramStorefrontRoute;
   inputMode: TelegramStorefrontInputMode;
+  inputPromptMessageId: number | null;
   revision: number;
   lastUpdateId: number;
 };
+
+export const STOREFRONT_LOCK_LEASE_MS = 45_000;
+
+export class StorefrontScopeBusyError extends Error {
+  constructor() {
+    super("Another storefront update is currently being processed");
+    this.name = "StorefrontScopeBusyError";
+  }
+}
 
 function keyFilter(binding: ActiveStorefrontBinding) {
   return and(
@@ -69,6 +80,7 @@ export async function readActiveStorefront(
       hasMedia: telegramActiveStorefront.hasMedia,
       route: telegramActiveStorefront.route,
       inputMode: telegramActiveStorefront.inputMode,
+      inputPromptMessageId: telegramActiveStorefront.inputPromptMessageId,
       revision: telegramActiveStorefront.revision,
       lastUpdateId: telegramActiveStorefront.lastUpdateId,
     })
@@ -83,6 +95,7 @@ export async function readActiveStorefront(
     hasMedia: row.hasMedia,
     route: row.route as TelegramStorefrontRoute,
     inputMode: row.inputMode as TelegramStorefrontInputMode,
+    inputPromptMessageId: row.inputPromptMessageId ?? null,
     revision: row.revision,
     lastUpdateId: row.lastUpdateId,
   };
@@ -103,6 +116,7 @@ export async function recordActiveStorefront(
     messageId: number;
     hasMedia: boolean;
     route: TelegramStorefrontRoute;
+    revision: number;
     updateId: number;
   },
 ): Promise<void> {
@@ -116,7 +130,8 @@ export async function recordActiveStorefront(
       hasMedia: input.hasMedia,
       route: input.route,
       inputMode: "none",
-      revision: 1,
+      inputPromptMessageId: null,
+      revision: input.revision,
       lastUpdateId: input.updateId,
       updatedAt: now,
     })
@@ -133,7 +148,8 @@ export async function recordActiveStorefront(
         hasMedia: input.hasMedia,
         route: input.route,
         inputMode: "none",
-        revision: sql`${telegramActiveStorefront.revision} + 1`,
+        inputPromptMessageId: null,
+        revision: input.revision,
         lastUpdateId: input.updateId,
         updatedAt: now,
       },
@@ -167,6 +183,7 @@ export async function adoptActiveStorefront(
       hasMedia: input.hasMedia,
       route: input.route ?? "storefront",
       inputMode: "none",
+      inputPromptMessageId: null,
       revision: 1,
       lastUpdateId: input.updateId,
       updatedAt: now,
@@ -199,6 +216,7 @@ export async function setActiveStorefrontInputMode(
   binding: ActiveStorefrontBinding,
   input: {
     inputMode: TelegramStorefrontInputMode;
+    promptMessageId?: number | null;
     updateId: number;
   },
 ): Promise<void> {
@@ -206,6 +224,7 @@ export async function setActiveStorefrontInputMode(
     .update(telegramActiveStorefront)
     .set({
       inputMode: input.inputMode,
+      inputPromptMessageId: input.promptMessageId ?? null,
       lastUpdateId: input.updateId,
       updatedAt: new Date(),
     })
@@ -213,6 +232,70 @@ export async function setActiveStorefrontInputMode(
       and(
         keyFilter(binding),
         sql`${telegramActiveStorefront.lastUpdateId} <= ${input.updateId}`,
+      ),
+    );
+}
+
+/**
+ * Claims the short-lived per-scope lease before any decision or Telegram
+ * side effect. The caller must hold this lease until its send/edit completes.
+ */
+export async function acquireStorefrontLock(
+  db: Database,
+  binding: ActiveStorefrontBinding,
+  ownerToken: string,
+  leaseMs = STOREFRONT_LOCK_LEASE_MS,
+): Promise<boolean> {
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + leaseMs);
+
+  const [row] = await db
+    .insert(telegramStorefrontLock)
+    .values({
+      ...keyColumns(binding),
+      ownerToken,
+      expiresAt,
+      updatedAt: now,
+    })
+    .onConflictDoUpdate({
+      target: [
+        telegramStorefrontLock.storeId,
+        telegramStorefrontLock.connectionId,
+        telegramStorefrontLock.botId,
+        telegramStorefrontLock.telegramUserId,
+        telegramStorefrontLock.telegramChatId,
+      ],
+      set: {
+        ownerToken,
+        expiresAt,
+        updatedAt: now,
+      },
+      where: sql`${telegramStorefrontLock.expiresAt} <= ${now.toISOString()}::timestamptz OR ${telegramStorefrontLock.ownerToken} = ${ownerToken}`,
+    })
+    .returning({ ownerToken: telegramStorefrontLock.ownerToken });
+
+  return row?.ownerToken === ownerToken;
+}
+
+/**
+ * Releases the lease only when this handler still owns it. A failed delete is
+ * harmless: the lease expires and the next update can reclaim it.
+ */
+export async function releaseStorefrontLock(
+  db: Database,
+  binding: ActiveStorefrontBinding,
+  ownerToken: string,
+): Promise<void> {
+  await db
+    .delete(telegramStorefrontLock)
+    .where(
+      and(
+        eq(telegramStorefrontLock.storeId, binding.storeId),
+        eq(telegramStorefrontLock.connectionId, binding.connectionId),
+        eq(telegramStorefrontLock.botId, binding.botId),
+        eq(telegramStorefrontLock.telegramUserId, binding.telegramUserId),
+        eq(telegramStorefrontLock.telegramChatId, binding.telegramChatId),
+        eq(telegramStorefrontLock.ownerToken, ownerToken),
       ),
     );
 }

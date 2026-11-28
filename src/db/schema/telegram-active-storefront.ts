@@ -64,6 +64,9 @@ export const telegramActiveStorefront = pgTable(
     hasMedia: boolean("has_media").notNull().default(false),
     route: text("route").notNull().default("storefront"),
     inputMode: text("input_mode").notNull().default("none"),
+    inputPromptMessageId: bigint("input_prompt_message_id", {
+      mode: "number",
+    }),
     revision: integer("revision").notNull().default(1),
     lastUpdateId: bigint("last_update_id", { mode: "number" }).notNull().default(0),
     updatedAt: timestamp("updated_at", { withTimezone: true, mode: "date" })
@@ -110,6 +113,10 @@ export const telegramActiveStorefront = pgTable(
       sql`${table.activeMessageId} > 0`,
     ),
     check(
+      "telegram_active_storefront_prompt_positive_check",
+      sql`${table.inputPromptMessageId} IS NULL OR ${table.inputPromptMessageId} > 0`,
+    ),
+    check(
       "telegram_active_storefront_bot_positive_check",
       sql`${table.botId} > 0`,
     ),
@@ -128,6 +135,72 @@ export const telegramActiveStorefront = pgTable(
     check(
       "telegram_active_storefront_update_positive_check",
       sql`${table.lastUpdateId} >= 0`,
+    ),
+  ],
+);
+
+/**
+ * `telegram_storefront_lock` — short-lived per-scope coordination for the
+ * storefront message lifecycle.
+ *
+ * A lease row is claimed before the handler reads the active screen and held
+ * until its Telegram send/edit has completed. The lease is intentionally
+ * longer than the webhook execution budget; a crashed process therefore
+ * leaves only an expired lease that the next update can reclaim. An unrelated
+ * store, connection, bot, chat or buyer has a different key and is never
+ * blocked.
+ */
+export const telegramStorefrontLock = pgTable(
+  "telegram_storefront_lock",
+  {
+    storeId: uuid("store_id").notNull(),
+    connectionId: uuid("connection_id").notNull(),
+    botId: bigint("bot_id", { mode: "number" }).notNull(),
+    telegramUserId: bigint("telegram_user_id", { mode: "number" }).notNull(),
+    telegramChatId: bigint("telegram_chat_id", { mode: "number" }).notNull(),
+    ownerToken: text("owner_token").notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true, mode: "date" })
+      .notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true, mode: "date" })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    primaryKey({
+      name: "telegram_storefront_lock_pkey",
+      columns: [
+        table.storeId,
+        table.connectionId,
+        table.botId,
+        table.telegramUserId,
+        table.telegramChatId,
+      ],
+    }),
+    foreignKey({
+      name: "telegram_storefront_lock_store_fk",
+      columns: [table.storeId],
+      foreignColumns: [store.id],
+    }).onDelete("cascade"),
+    foreignKey({
+      name: "telegram_storefront_lock_connection_fk",
+      columns: [table.connectionId],
+      foreignColumns: [telegramConnection.id],
+    }).onDelete("cascade"),
+    check(
+      "telegram_storefront_lock_owner_check",
+      sql`char_length(${table.ownerToken}) BETWEEN 1 AND 128`,
+    ),
+    check(
+      "telegram_storefront_lock_bot_positive_check",
+      sql`${table.botId} > 0`,
+    ),
+    check(
+      "telegram_storefront_lock_user_positive_check",
+      sql`${table.telegramUserId} > 0`,
+    ),
+    check(
+      "telegram_storefront_lock_chat_positive_check",
+      sql`${table.telegramChatId} > 0`,
     ),
   ],
 );

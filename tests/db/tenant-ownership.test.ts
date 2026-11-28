@@ -70,6 +70,7 @@ const ALL_STORE_ID_TABLES = [
   "telegram_link_attempt",
   "telegram_active_storefront",
   "telegram_navigation_context",
+  "telegram_storefront_lock",
   "store_commerce_setting",
   "product_inventory",
   "cart",
@@ -400,13 +401,13 @@ describe.skipIf(!shouldRun)("S1.2 tenant ownership schema", () => {
     const journal = await testDb!.db.execute<{ count: number }>(sql`
       select count(*)::int as count from drizzle.__drizzle_migrations
     `);
-    expect(journal[0].count).toBe(25);
+    expect(journal[0].count).toBe(26);
 
     const tables = await testDb!.db.execute<{ count: number }>(sql`
       select count(*)::int as count from information_schema.tables
       where table_schema = 'public'
     `);
-    expect(tables[0].count).toBe(41);
+    expect(tables[0].count).toBe(42);
 
     const columns = await testDb!.db.execute<{
       table_name: string;
@@ -432,6 +433,7 @@ describe.skipIf(!shouldRun)("S1.2 tenant ownership schema", () => {
           column.table_name === "telegram_link_attempt" ||
           column.table_name === "telegram_active_storefront" ||
           column.table_name === "telegram_navigation_context" ||
+          column.table_name === "telegram_storefront_lock" ||
           column.table_name === "store_commerce_setting" ||
           column.table_name === "product_inventory" ||
           column.table_name === "cart" ||

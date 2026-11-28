@@ -169,6 +169,7 @@ beforeEach(async () => {
       "cart_item",
       "cart",
       "telegram_active_storefront",
+      "telegram_storefront_lock",
       "telegram_managed_update"
     restart identity cascade
   `);
