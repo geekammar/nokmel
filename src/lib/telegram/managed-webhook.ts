@@ -27,6 +27,7 @@ import {
   confirmVodafoneCashOrder,
   readCartForBuyer,
   readLatestBuyerCodOrder,
+  readPlacedOrderForCart,
   bindVodafoneCashTransferPromptMessage,
   listBuyerOutstandingVodafoneTransfers,
   readCheckoutAvailability,
@@ -2999,32 +3000,35 @@ async function dispatchCallback(
 
   const callbackRevision = screenRevisionFromData(callbackQuery.data);
   const receiptHome = parsedToken.type === "receiptHome";
-  const confirmationReplay =
+  const confirmation =
     parsedToken.type === "confirmCod" ||
     parsedToken.type === "confirmVodafoneCash";
 
-  // Confirmation replays are idempotent commerce operations and receipt Home
-  // is independent of the storefront. Every other callback is bound to the
-  // current screen revision, so a button from an earlier rendering of the same
-  // message cannot act after that screen was replaced.
+  // Confirmation controls still validate screen identity before a NEW order,
+  // but a retired control with an already committed order recovers that order
+  // read-only instead of placing anything. Receipt Home is independent of the
+  // storefront; every other callback is bound to the current screen revision.
+  const orderingStale =
+    active !== null &&
+    (active.lastUpdateId > updateAttempt.updateId ||
+      callbackMessageId < active.messageId);
   const revisionMismatch =
     active !== null &&
     !receiptHome &&
-    !confirmationReplay &&
     callbackRevision !== null &&
     callbackRevision !== active.revision;
 
   const stale =
     !receiptHome &&
-    !confirmationReplay &&
+    !confirmation &&
     active !== null &&
-    (active.lastUpdateId > updateAttempt.updateId ||
-      callbackMessageId < active.messageId ||
-      revisionMismatch);
+    (orderingStale || revisionMismatch);
+  const confirmationStale =
+    confirmation && active !== null && (orderingStale || revisionMismatch);
 
   const ack = await transport.answerCallbackQuery({
     callbackQueryId: callbackQuery.id,
-    ...(stale ? { text: copy.staleScreen } : {}),
+    ...(stale || confirmationStale ? { text: copy.staleScreen } : {}),
   });
 
   if (!ack.ok && ack.errorKind !== "callback_expired") {
@@ -3039,6 +3043,59 @@ async function dispatchCallback(
       parsedToken.type !== "homeNew"
     ) {
       await clearMessageKeyboard(transport, chatId, callbackMessageId);
+    }
+    return;
+  }
+
+  if (
+    confirmationStale &&
+    (parsedToken.type === "confirmCod" ||
+      parsedToken.type === "confirmVodafoneCash")
+  ) {
+    const recoveryMessageId = active?.messageId ?? callbackMessageId;
+    const existing = await readPlacedOrderForCart(
+      commerceDb ?? db,
+      scope,
+      {
+        cartId: parsedToken.cartId,
+        connectionId,
+        telegramUserId: buyerId,
+        telegramChatId: chatId,
+        paymentMethod:
+          parsedToken.type === "confirmCod" ? "cod" : "vodafone_cash",
+      },
+    );
+
+    if (!existing) return;
+
+    if (parsedToken.type === "confirmCod") {
+      await renderPlacedOrderOnActiveMessage(
+        transport,
+        chatId,
+        recoveryMessageId,
+        existing,
+        copy,
+        true,
+      );
+      return;
+    }
+
+    const state = await readVodafoneCashOrderState(commerceDb ?? db, scope, {
+      connectionId,
+      telegramUserId: buyerId,
+      telegramChatId: chatId,
+      orderId: existing.orderId,
+    });
+
+    if (state) {
+      await renderVodafoneOrderState(
+        transport,
+        chatId,
+        recoveryMessageId,
+        state,
+        context.language.locale,
+        copy,
+      );
     }
     return;
   }

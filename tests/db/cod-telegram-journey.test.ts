@@ -41,7 +41,11 @@ import { handleManagedTelegramWebhookRequest } from "@/lib/telegram/managed-webh
 import {
   NAVIGATION_CONTEXT_PRUNE_BATCH_SIZE,
 } from "@/lib/telegram/navigation-context";
-import { tokens, withoutScreenRevision } from "@/lib/telegram/tokens";
+import {
+  tokens,
+  withScreenRevision,
+  withoutScreenRevision,
+} from "@/lib/telegram/tokens";
 import {
   createFakeTelegramTransport,
   type FakeTelegramTransport,
@@ -3896,5 +3900,144 @@ describe.skipIf(!shouldRun)("COD managed Telegram journey", () => {
       expect(await db().select().from(order)).toHaveLength(0);
     });
   });
+
+    it("does not place a new COD order from a retired review confirmation", async () => {
+      const buyer = 94007;
+      const { cartId, confirmData, transport: reviewTransport } =
+        await completeReview(buyer);
+      const reviewId = lastScreenMessage(reviewTransport)!.messageId;
+
+      const home = await call(
+        fixture.connectionAId,
+        messageUpdate(buyer, "/start", {}, "en"),
+      );
+      expect(home.status).toBe(200);
+
+      const staleTransport = createFakeTelegramTransport();
+      const stale = await call(
+        fixture.connectionAId,
+        callbackUpdate(buyer, confirmData, "en", reviewId),
+        "bot-secret-a",
+        staleTransport,
+      );
+      expect(stale.status).toBe(200);
+      expect(stale.transport.answeredCallbacks.at(-1)?.text).toContain(
+        "no longer active",
+      );
+      expect(stale.transport.sentMessages).toHaveLength(0);
+      expect(stale.transport.editedMessages).toHaveLength(0);
+
+      const [cartRow] = await db()
+        .select()
+        .from(cart)
+        .where(eq(cart.id, cartId));
+      expect(cartRow.status).toBe("checkout");
+      expect(cartRow.checkoutState).toBe("review");
+      expect(await db().select().from(order)).toHaveLength(0);
+      expect(await db().select().from(inventoryReservation)).toHaveLength(0);
+    });
+
+    it("recovers an already placed COD order from a retired confirmation without duplicating it", async () => {
+      const buyer = 94008;
+      const { confirmData, transport: reviewTransport } = await completeReview(buyer);
+      const reviewId = lastScreenMessage(reviewTransport)!.messageId;
+      const transport = createFakeTelegramTransport();
+      const placed = await call(
+        fixture.connectionAId,
+        callbackUpdate(buyer, confirmData, "en", reviewId),
+        "bot-secret-a",
+        transport,
+      );
+      const receipt = lastReceipt(placed.transport)!;
+      const reference = /ORD-[A-HJ-NP-Z2-9]{6}/.exec(receipt.text)?.[0];
+      expect(reference).toBeDefined();
+      const receiptId = receipt.messageId;
+      const ordersBefore = await db().select().from(order);
+      const reservationsBefore = await db().select().from(inventoryReservation);
+      expect(ordersBefore).toHaveLength(1);
+      expect(reservationsBefore).toHaveLength(1);
+
+      await call(
+        fixture.connectionAId,
+        messageUpdate(buyer, "/start", {}, "en"),
+        "bot-secret-a",
+        transport,
+      );
+      const sentBefore = transport.sentMessages.length;
+
+      const recovered = await call(
+        fixture.connectionAId,
+        callbackUpdate(buyer, confirmData, "en", reviewId),
+        "bot-secret-a",
+        transport,
+      );
+      expect(recovered.status).toBe(200);
+      expect(lastText(recovered.transport)).toContain(reference!);
+      expect(recovered.transport.sentMessages).toHaveLength(sentBefore);
+      expect(
+        recovered.transport.editedMessages.some(
+          (entry) => entry.messageId === receiptId,
+        ),
+      ).toBe(false);
+      expect(await db().select().from(order)).toEqual(ordersBefore);
+      expect(await db().select().from(inventoryReservation)).toEqual(
+        reservationsBefore,
+      );
+      expect(await activeStorefrontRow(buyer)).toMatchObject({
+        route: "receipt_bridge",
+      });
+    });
+
+    it("keeps screen identities distinct at and beyond the old 46656 boundary", async () => {
+      const buyer = 94009;
+      const start = await call(
+        fixture.connectionAId,
+        messageUpdate(buyer, "/start", {}, "en"),
+      );
+      const home = start.transport.sentMessages.at(-1)!;
+      const key = and(
+        eq(telegramActiveStorefront.connectionId, fixture.connectionAId),
+        eq(telegramActiveStorefront.telegramUserId, buyer),
+        eq(telegramActiveStorefront.telegramChatId, buyer),
+      );
+
+      for (const revision of [46_655, 46_656, 46_657]) {
+        await db()
+          .update(telegramActiveStorefront)
+          .set({ revision, route: "home", inputMode: "none" })
+          .where(key);
+
+        const token = withScreenRevision(tokens.products(), revision);
+        const current = await call(
+          fixture.connectionAId,
+          callbackUpdate(buyer, token, "en", home.messageId),
+        );
+        expect(current.status).toBe(200);
+        expect(current.transport.editedMessages.at(-1)?.messageId).toBe(
+          home.messageId,
+        );
+        expect(await activeStorefrontRow(buyer)).toMatchObject({
+          revision: revision + 1,
+          route: "products",
+        });
+
+        const staleTransport = createFakeTelegramTransport();
+        const stale = await call(
+          fixture.connectionAId,
+          callbackUpdate(buyer, token, "en", home.messageId),
+          "bot-secret-a",
+          staleTransport,
+        );
+        expect(stale.status).toBe(200);
+        expect(stale.transport.answeredCallbacks.at(-1)?.text).toContain(
+          "no longer active",
+        );
+        expect(stale.transport.editedMessages).toHaveLength(0);
+        expect(await activeStorefrontRow(buyer)).toMatchObject({
+          revision: revision + 1,
+          route: "products",
+        });
+      }
+    });
 
 });

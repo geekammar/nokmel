@@ -1056,4 +1056,55 @@ describe.skipIf(!shouldRun)("Vodafone Cash managed Telegram journey", () => {
         .where(eq(inventoryReservation.orderId, first.orderId)),
     ).toMatchObject([{ status: "released" }]);
   });
+  it("does not place a new Vodafone order from a retired review confirmation", async () => {
+    const reviewed = await reviewCart(BUYER_A);
+    const vodafoneButton = reviewed.vodafoneButton!;
+    const reviewId = reviewed.reviewMessage!.messageId;
+
+    await call(messageUpdate(BUYER_A, "/start"), reviewed.transport);
+
+    const staleTransport = createFakeTelegramTransport();
+    const stale = await call(
+      callbackUpdate(BUYER_A, vodafoneButton.callback_data!, reviewId),
+      staleTransport,
+    );
+    expect(stale.status).toBe(200);
+    expect(stale.transport.answeredCallbacks.at(-1)?.text).toContain(
+      "no longer active",
+    );
+    expect(stale.transport.sentMessages).toHaveLength(0);
+    expect(stale.transport.editedMessages).toHaveLength(0);
+    expect(await db().select().from(order)).toHaveLength(0);
+    expect(await db().select().from(inventoryReservation)).toHaveLength(0);
+    expect(await db().select().from(orderPaymentClaim)).toHaveLength(0);
+  });
+
+  it("recovers an already placed Vodafone order from a retired confirmation without duplicating it", async () => {
+    const reviewed = await reviewCart(BUYER_A);
+    const vodafoneButton = reviewed.vodafoneButton!;
+    const reviewId = reviewed.reviewMessage!.messageId;
+
+    const placed = await call(
+      callbackUpdate(BUYER_A, vodafoneButton.callback_data!, reviewId),
+      reviewed.transport,
+    );
+    expect(placed.status).toBe(200);
+    const [orderRow] = await db().select().from(order);
+    expect(orderRow).toBeDefined();
+    expect(await db().select().from(inventoryReservation)).toHaveLength(1);
+
+    await call(messageUpdate(BUYER_A, "/start"), placed.transport);
+
+    const recovered = await call(
+      callbackUpdate(BUYER_A, vodafoneButton.callback_data!, reviewId),
+      placed.transport,
+    );
+    expect(recovered.status).toBe(200);
+    expect(lastText(recovered.transport)).toContain(orderRow.reference);
+    expect(lastText(recovered.transport)).toContain("Vodafone Cash transfer");
+    expect(await db().select().from(order)).toHaveLength(1);
+    expect(await db().select().from(inventoryReservation)).toHaveLength(1);
+    expect(await db().select().from(orderPaymentClaim)).toHaveLength(0);
+  });
+
 });
