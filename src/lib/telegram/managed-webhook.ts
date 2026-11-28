@@ -233,6 +233,25 @@ async function readActiveStorefrontSafely(
   }
 }
 
+async function readConfirmationRecoverySafely(
+  db: Database | TransactionDatabase,
+  scope: StoreScope,
+  input: {
+    cartId: string;
+    connectionId: string;
+    telegramUserId: number;
+    telegramChatId: number;
+    paymentMethod: "cod" | "vodafone_cash";
+  },
+) {
+  try {
+    return await readPlacedOrderForCart(db, scope, input);
+  } catch (error) {
+    logActiveStorefrontFailure("read", error);
+    return null;
+  }
+}
+
 async function recordActiveStorefrontSafely(
   transport: TelegramTransport,
   messageId: number,
@@ -3004,10 +3023,10 @@ async function dispatchCallback(
     parsedToken.type === "confirmCod" ||
     parsedToken.type === "confirmVodafoneCash";
 
-  // Confirmation controls still validate screen identity before a NEW order,
-  // but a retired control with an already committed order recovers that order
-  // read-only instead of placing anything. Receipt Home is independent of the
-  // storefront; every other callback is bound to the current screen revision.
+  // Confirmation controls need positive evidence before a NEW order: a
+  // verified active review screen, the same message, a carried revision that
+  // matches it, and update ordering that is not older than that screen. A
+  // missing/failed state read or any mismatch is treated as unverified.
   const orderingStale =
     active !== null &&
     (active.lastUpdateId > updateAttempt.updateId ||
@@ -3018,17 +3037,54 @@ async function dispatchCallback(
     callbackRevision !== null &&
     callbackRevision !== active.revision;
 
+  const confirmationVerified =
+    confirmation &&
+    active !== null &&
+    active.route === "review" &&
+    callbackMessageId === active.messageId &&
+    callbackRevision !== null &&
+    callbackRevision === active.revision &&
+    active.lastUpdateId <= updateAttempt.updateId;
+
   const stale =
     !receiptHome &&
     !confirmation &&
     active !== null &&
     (orderingStale || revisionMismatch);
-  const confirmationStale =
-    confirmation && active !== null && (orderingStale || revisionMismatch);
+  const confirmationStale = confirmation && !confirmationVerified;
+
+  let confirmationRecoveryReference: string | null = null;
+  if (
+    confirmationStale &&
+    (parsedToken.type === "confirmCod" ||
+      parsedToken.type === "confirmVodafoneCash")
+  ) {
+    const existing = await readConfirmationRecoverySafely(
+      commerceDb ?? db,
+      scope,
+      {
+        cartId: parsedToken.cartId,
+        connectionId,
+        telegramUserId: buyerId,
+        telegramChatId: chatId,
+        paymentMethod:
+          parsedToken.type === "confirmCod" ? "cod" : "vodafone_cash",
+      },
+    );
+    confirmationRecoveryReference = existing?.reference ?? null;
+  }
 
   const ack = await transport.answerCallbackQuery({
     callbackQueryId: callbackQuery.id,
-    ...(stale || confirmationStale ? { text: copy.staleScreen } : {}),
+    ...(stale
+      ? { text: copy.staleScreen }
+      : confirmationStale
+        ? {
+            text: confirmationRecoveryReference
+              ? copy.confirmationAlreadyPlaced(confirmationRecoveryReference)
+              : copy.staleConfirmation,
+          }
+        : {}),
   });
 
   if (!ack.ok && ack.errorKind !== "callback_expired") {
@@ -3047,56 +3103,9 @@ async function dispatchCallback(
     return;
   }
 
-  if (
-    confirmationStale &&
-    (parsedToken.type === "confirmCod" ||
-      parsedToken.type === "confirmVodafoneCash")
-  ) {
-    const recoveryMessageId = active?.messageId ?? callbackMessageId;
-    const existing = await readPlacedOrderForCart(
-      commerceDb ?? db,
-      scope,
-      {
-        cartId: parsedToken.cartId,
-        connectionId,
-        telegramUserId: buyerId,
-        telegramChatId: chatId,
-        paymentMethod:
-          parsedToken.type === "confirmCod" ? "cod" : "vodafone_cash",
-      },
-    );
-
-    if (!existing) return;
-
-    if (parsedToken.type === "confirmCod") {
-      await renderPlacedOrderOnActiveMessage(
-        transport,
-        chatId,
-        recoveryMessageId,
-        existing,
-        copy,
-        true,
-      );
-      return;
-    }
-
-    const state = await readVodafoneCashOrderState(commerceDb ?? db, scope, {
-      connectionId,
-      telegramUserId: buyerId,
-      telegramChatId: chatId,
-      orderId: existing.orderId,
-    });
-
-    if (state) {
-      await renderVodafoneOrderState(
-        transport,
-        chatId,
-        recoveryMessageId,
-        state,
-        context.language.locale,
-        copy,
-      );
-    }
+  if (confirmationStale) {
+    // Recovery is acknowledgement-only: never edit, replace or adopt the
+    // active storefront, issue new controls, or touch the receipt.
     return;
   }
 

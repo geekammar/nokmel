@@ -677,6 +677,52 @@ function navigationReadFailingDb(): Database {
   }) as Database;
 }
 
+
+function activeReadFailingDb(): Database {
+  const real = asAppDb(db());
+
+  return new Proxy(real, {
+    get(target, property, receiver) {
+      if (property === "select") {
+        return (...args: unknown[]) => {
+          const select = Reflect.get(target, property) as (
+            ...values: unknown[]
+          ) => object;
+          const query = select.apply(target, args);
+
+          return new Proxy(query, {
+            get(queryTarget, queryProperty, queryReceiver) {
+              if (queryProperty === "from") {
+                return (table: unknown) => {
+                  if (table === telegramActiveStorefront) {
+                    throw new Error("active storefront read failed");
+                  }
+                  const from = Reflect.get(queryTarget, queryProperty) as (
+                    value: unknown,
+                  ) => unknown;
+                  return from.call(queryTarget, table);
+                };
+              }
+
+              const value = Reflect.get(
+                queryTarget,
+                queryProperty,
+                queryReceiver,
+              );
+              return typeof value === "function"
+                ? value.bind(queryTarget)
+                : value;
+            },
+          });
+        };
+      }
+
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  }) as Database;
+}
+
 function inlineButtons(message: {
   replyMarkup?: unknown;
 }): Array<{ text: string; callback_data?: string; url?: string }> {
@@ -802,6 +848,7 @@ async function completeReview(
 ): Promise<{
   cartId: string;
   confirmData: string;
+  reviewMessageId: number;
   transport: FakeTelegramTransport;
 }> {
   const { cartId } = await addAndCheckout(buyerId, connectionId, secret);
@@ -839,6 +886,7 @@ async function completeReview(
   return {
     cartId,
     confirmData: confirm!.callback_data!,
+    reviewMessageId: reviewMessage!.messageId,
     transport: reviewed.transport,
   };
 }
@@ -1358,11 +1406,11 @@ describe.skipIf(!shouldRun)("COD managed Telegram journey", () => {
   });
 
   it("places one COD order from product to contact, address, review and confirmation", async () => {
-    const { cartId, confirmData } = await completeReview();
+    const { cartId, confirmData, reviewMessageId } = await completeReview();
 
     const confirmed = await call(
       fixture.connectionAId,
-      callbackUpdate(BUYER_A, confirmData),
+      callbackUpdate(BUYER_A, confirmData, undefined, reviewMessageId),
     );
 
     expect(confirmed.status).toBe(200);
@@ -1400,17 +1448,23 @@ describe.skipIf(!shouldRun)("COD managed Telegram journey", () => {
     expect(inventory.reserved).toBe(2);
     expect(inventory.onHand).toBe(5);
 
-    // A second tap is a separate Telegram update. It must return the same
-    // reference, edit only, and must not reserve stock or send a receipt again.
+    // A second tap is a separate Telegram update. It is a retired
+    // confirmation, so it acknowledges the same reference read-only, without
+    // editing the active storefront or sending a receipt again.
+    const editedBeforeDuplicate = confirmed.transport.editedMessages.length;
     const duplicate = await call(
       fixture.connectionAId,
-      callbackUpdate(BUYER_A, confirmData),
+      callbackUpdate(BUYER_A, confirmData, undefined, reviewMessageId),
       "bot-secret-a",
       confirmed.transport,
     );
     expect(duplicate.status).toBe(200);
-    expect(lastText(duplicate.transport)).toContain(`Order ${reference} placed`);
-    expect(lastText(duplicate.transport)).toContain("Total: 37.00 SAR");
+    expect(duplicate.transport.answeredCallbacks.at(-1)?.text).toContain(
+      reference!,
+    );
+    expect(duplicate.transport.editedMessages).toHaveLength(
+      editedBeforeDuplicate,
+    );
     expect(
       duplicate.transport.sentMessages.filter((message) =>
         message.text.includes(`Order ${reference} placed`),
@@ -1496,7 +1550,7 @@ describe.skipIf(!shouldRun)("COD managed Telegram journey", () => {
   );
 
   it("returns a revised review instead of placing an order when the quote changed", async () => {
-    const { confirmData } = await completeReview();
+    const { confirmData, reviewMessageId } = await completeReview();
 
     await db()
       .update(product)
@@ -1509,7 +1563,7 @@ describe.skipIf(!shouldRun)("COD managed Telegram journey", () => {
 
     const stale = await call(
       fixture.connectionAId,
-      callbackUpdate(BUYER_A, confirmData),
+      callbackUpdate(BUYER_A, confirmData, undefined, reviewMessageId),
     );
 
     expect(stale.status).toBe(200);
@@ -1529,7 +1583,7 @@ describe.skipIf(!shouldRun)("COD managed Telegram journey", () => {
 
     const placed = await call(
       fixture.connectionAId,
-      callbackUpdate(BUYER_A, confirm!.callback_data!),
+      callbackUpdate(BUYER_A, confirm!.callback_data!, undefined, reviewMessageId),
     );
     expect(placed.status).toBe(200);
     expect(lastText(placed.transport)).toContain("placed");
@@ -1538,19 +1592,21 @@ describe.skipIf(!shouldRun)("COD managed Telegram journey", () => {
   });
 
   it("does not let another buyer in the same store confirm the cart", async () => {
-    const { confirmData } = await completeReview();
+    const { confirmData, reviewMessageId } = await completeReview();
 
     const foreign = await call(
       fixture.connectionAId,
-      callbackUpdate(BUYER_B, confirmData),
+      callbackUpdate(BUYER_B, confirmData, undefined, reviewMessageId),
     );
     expect(foreign.status).toBe(200);
-    expect(lastText(foreign.transport)).toContain("This cart is not available");
+    expect(foreign.transport.answeredCallbacks.at(-1)?.text).toContain(
+      "This confirmation is no longer active",
+    );
     expect(await db().select().from(order)).toHaveLength(0);
 
     const own = await call(
       fixture.connectionAId,
-      callbackUpdate(BUYER_A, confirmData),
+      callbackUpdate(BUYER_A, confirmData, undefined, reviewMessageId),
     );
     expect(own.status).toBe(200);
     expect(lastText(own.transport)).toContain("placed");
@@ -1558,15 +1614,17 @@ describe.skipIf(!shouldRun)("COD managed Telegram journey", () => {
   });
 
   it("does not let the other store confirm or order the cart", async () => {
-    const { confirmData } = await completeReview();
+    const { confirmData, reviewMessageId } = await completeReview();
 
     const foreign = await call(
       fixture.connectionBId,
-      callbackUpdate(BUYER_B, confirmData),
+      callbackUpdate(BUYER_B, confirmData, undefined, reviewMessageId),
       "bot-secret-b",
     );
     expect(foreign.status).toBe(200);
-    expect(lastText(foreign.transport)).toContain("This cart is not available");
+    expect(foreign.transport.answeredCallbacks.at(-1)?.text).toContain(
+      "This confirmation is no longer active",
+    );
     expect(await db().select().from(order)).toHaveLength(0);
 
     const foreignProduct = await call(
@@ -1581,7 +1639,7 @@ describe.skipIf(!shouldRun)("COD managed Telegram journey", () => {
 
     const own = await call(
       fixture.connectionAId,
-      callbackUpdate(BUYER_A, confirmData),
+      callbackUpdate(BUYER_A, confirmData, undefined, reviewMessageId),
     );
     expect(own.status).toBe(200);
     expect(lastText(own.transport)).toContain("placed");
@@ -1666,7 +1724,12 @@ describe.skipIf(!shouldRun)("COD managed Telegram journey", () => {
 
     const confirmed = await call(
       fixture.connectionAId,
-      callbackUpdate(BUYER_A, confirm!.callback_data!, "ar"),
+      callbackUpdate(
+        BUYER_A,
+        confirm!.callback_data!,
+        "ar",
+        reviewMessage!.messageId,
+      ),
     );
     expect(confirmed.status).toBe(200);
     expect(lastText(confirmed.transport)).toContain("تم تسجيل الطلب");
@@ -1982,7 +2045,12 @@ describe.skipIf(!shouldRun)("COD managed Telegram journey", () => {
 
     const confirmed = await call(
       fixture.connectionAId,
-      callbackUpdate(buyer, confirmButton!.callback_data!),
+      callbackUpdate(
+        buyer,
+        confirmButton!.callback_data!,
+        undefined,
+        lastScreenMessage(reviewEnglish.transport)!.messageId,
+      ),
     );
     expect(lastText(confirmed.transport)).toContain("placed");
     expect(lastReceipt(confirmed.transport)?.text).toContain(
@@ -2241,7 +2309,12 @@ describe.skipIf(!shouldRun)("COD managed Telegram journey", () => {
 
     await call(
       fixture.connectionAId,
-      callbackUpdate(buyer, confirmButton!.callback_data!),
+      callbackUpdate(
+        buyer,
+        confirmButton!.callback_data!,
+        undefined,
+        lastScreenMessage(reviewed.transport)!.messageId,
+      ),
     );
 
     const orders = await db().select().from(order);
@@ -2280,12 +2353,12 @@ describe.skipIf(!shouldRun)("COD managed Telegram journey", () => {
     expect(denied).toEqual({ ok: false, error: "DENIED" });
   });
   it("keeps the separate placed receipt when returning home and changing language", async () => {
-    const { confirmData } = await completeReview();
+    const { confirmData, reviewMessageId } = await completeReview();
     const transport = createFakeTelegramTransport();
 
     const confirmed = await call(
       fixture.connectionAId,
-      callbackUpdate(BUYER_A, confirmData),
+      callbackUpdate(BUYER_A, confirmData, undefined, reviewMessageId),
       "bot-secret-a",
       transport,
     );
@@ -2361,9 +2434,10 @@ describe.skipIf(!shouldRun)("COD managed Telegram journey", () => {
       ),
     ).toHaveLength(1);
 
-    // A replayed confirmation after browsing edits the stale message with the
-    // same receipt; it never creates another order, reservation or receipt
-    // send.
+    // A replayed confirmation after browsing is acknowledged read-only: it
+    // never edits the active home or the separate receipt, and never creates
+    // another order, reservation or receipt send.
+    const editedBeforeReplay = switched.transport.editedMessages.length;
     const replayed = await call(
       fixture.connectionAId,
       callbackUpdate(BUYER_A, confirmData, undefined, bridgeMessageId),
@@ -2371,27 +2445,34 @@ describe.skipIf(!shouldRun)("COD managed Telegram journey", () => {
       transport,
     );
     expect(replayed.status).toBe(200);
-    expect(lastText(replayed.transport)).toContain(reference!);
-    expect(lastText(replayed.transport)).toContain("37.00 SAR");
+    expect(replayed.transport.answeredCallbacks.at(-1)?.text).toContain(
+      reference!,
+    );
+    expect(replayed.transport.editedMessages).toHaveLength(editedBeforeReplay);
     expect(
       replayed.transport.sentMessages.filter((message) =>
         message.text.includes(reference!),
       ),
     ).toHaveLength(1);
+    expect(
+      replayed.transport.editedMessages.some(
+        (message) => message.messageId === receiptId,
+      ),
+    ).toBe(false);
 
     expect(await db().select().from(order)).toHaveLength(1);
     expect(await db().select().from(inventoryReservation)).toHaveLength(1);
   });
 
   it("does not duplicate the order or blind-resend the receipt when delivery is ambiguous", async () => {
-    const { confirmData } = await completeReview();
+    const { confirmData, reviewMessageId } = await completeReview();
     const transport = createFakeTelegramTransport();
     transport.failSendWith = "Request timed out";
     transport.failSendKind = "timeout";
 
     const confirmed = await call(
       fixture.connectionAId,
-      callbackUpdate(BUYER_A, confirmData),
+      callbackUpdate(BUYER_A, confirmData, undefined, reviewMessageId),
       "bot-secret-a",
       transport,
     );
@@ -2412,7 +2493,7 @@ describe.skipIf(!shouldRun)("COD managed Telegram journey", () => {
 
     const replayed = await call(
       fixture.connectionAId,
-      callbackUpdate(BUYER_A, confirmData),
+      callbackUpdate(BUYER_A, confirmData, undefined, reviewMessageId),
       "bot-secret-a",
       transport,
     );
@@ -3439,7 +3520,8 @@ describe.skipIf(!shouldRun)("COD managed Telegram journey", () => {
 
     it("replays checkout confirmation on the active browse screen without touching the receipt or duplicating commerce", async () => {
       const buyer = 93008;
-      const { confirmData, transport: reviewTransport } = await completeReview(buyer);
+      const { confirmData, transport: reviewTransport } =
+        await completeReview(buyer);
       const reviewId = lastScreenMessage(reviewTransport)!.messageId;
 
       const transport = createFakeTelegramTransport();
@@ -3485,8 +3567,10 @@ describe.skipIf(!shouldRun)("COD managed Telegram journey", () => {
       });
 
       // The old review message id is lower than the fresh browse screen in a
-      // real chat. The fake transport resets ids per call, so replay from the
-      // immediately preceding message id to prove the older-message path.
+      // real chat. The replay is acknowledgement-only and must leave the
+      // active home and its buttons fully usable.
+      const activeBefore = await activeStorefrontRow(buyer);
+      const editedBeforeReplay = transport.editedMessages.length;
       const replayed = await call(
         fixture.connectionAId,
         callbackUpdate(buyer, confirmData, "en", homeMessage.messageId - 1),
@@ -3494,8 +3578,12 @@ describe.skipIf(!shouldRun)("COD managed Telegram journey", () => {
         transport,
       );
       expect(replayed.status).toBe(200);
-      expect(lastText(replayed.transport)).toContain(reference!);
-      expect(lastText(replayed.transport)).toContain("37.00 SAR");
+      expect(replayed.transport.answeredCallbacks.at(-1)?.text).toContain(
+        reference!,
+      );
+      expect(replayed.transport.editedMessages).toHaveLength(
+        editedBeforeReplay,
+      );
       expect(
         replayed.transport.editedMessages.some(
           (entry) => entry.messageId === receiptId,
@@ -3508,9 +3596,28 @@ describe.skipIf(!shouldRun)("COD managed Telegram journey", () => {
       ).toHaveLength(1);
       expect(await db().select().from(order)).toHaveLength(1);
       expect(await db().select().from(inventoryReservation)).toHaveLength(1);
+      expect(await activeStorefrontRow(buyer)).toEqual(activeBefore);
+
+      const currentButton = inlineButtons(homeMessage).find((button) =>
+        button.callback_data?.startsWith("langs:"),
+      );
+      expect(currentButton?.callback_data).toBeDefined();
+      const current = await call(
+        fixture.connectionAId,
+        callbackUpdate(
+          buyer,
+          currentButton!.callback_data!,
+          "en",
+          homeMessage.messageId,
+        ),
+        "bot-secret-a",
+        transport,
+      );
+      expect(current.status).toBe(200);
+      expect(lastText(current.transport)).toContain("Choose your language");
       expect(await activeStorefrontRow(buyer)).toMatchObject({
         activeMessageId: homeMessage.messageId,
-        route: "receipt_bridge",
+        route: "language",
       });
     });
   });
@@ -3751,7 +3858,8 @@ describe.skipIf(!shouldRun)("COD managed Telegram journey", () => {
 
     it("repeated Home from a receipt reuses the active storefront without touching the receipt", async () => {
       const buyer = 94005;
-      const { confirmData, transport: reviewTransport } = await completeReview(buyer);
+      const { confirmData, transport: reviewTransport } =
+        await completeReview(buyer);
       const reviewId = lastScreenMessage(reviewTransport)!.messageId;
       const transport = createFakeTelegramTransport();
       const confirmed = await call(
@@ -3937,9 +4045,75 @@ describe.skipIf(!shouldRun)("COD managed Telegram journey", () => {
       expect(await db().select().from(inventoryReservation)).toHaveLength(0);
     });
 
+    it("does not place a COD order when the active state is missing", async () => {
+      const buyer = 94010;
+      const { cartId, confirmData, reviewMessageId } = await completeReview(buyer);
+      await db()
+        .delete(telegramActiveStorefront)
+        .where(
+          and(
+            eq(telegramActiveStorefront.connectionId, fixture.connectionAId),
+            eq(telegramActiveStorefront.telegramUserId, buyer),
+            eq(telegramActiveStorefront.telegramChatId, buyer),
+          ),
+        );
+
+      const transport = createFakeTelegramTransport();
+      const result = await call(
+        fixture.connectionAId,
+        callbackUpdate(buyer, confirmData, "en", reviewMessageId),
+        "bot-secret-a",
+        transport,
+      );
+      expect(result.status).toBe(200);
+      expect(result.transport.answeredCallbacks.at(-1)?.text).toContain(
+        "This confirmation is no longer active",
+      );
+      expect(result.transport.sentMessages).toHaveLength(0);
+      expect(result.transport.editedMessages).toHaveLength(0);
+      expect(await db().select().from(order)).toHaveLength(0);
+      expect(await db().select().from(inventoryReservation)).toHaveLength(0);
+
+      const [cartRow] = await db()
+        .select()
+        .from(cart)
+        .where(eq(cart.id, cartId));
+      expect(cartRow.status).toBe("checkout");
+      expect(cartRow.checkoutState).toBe("review");
+    });
+
+    it("does not place a COD order when the active-state read fails", async () => {
+      const buyer = 94011;
+      const { cartId, confirmData, reviewMessageId } = await completeReview(buyer);
+      const transport = createFakeTelegramTransport();
+      const result = await call(
+        fixture.connectionAId,
+        callbackUpdate(buyer, confirmData, "en", reviewMessageId),
+        "bot-secret-a",
+        transport,
+        { db: activeReadFailingDb() },
+      );
+      expect(result.status).toBe(200);
+      expect(result.transport.answeredCallbacks.at(-1)?.text).toContain(
+        "This confirmation is no longer active",
+      );
+      expect(result.transport.sentMessages).toHaveLength(0);
+      expect(result.transport.editedMessages).toHaveLength(0);
+      expect(await db().select().from(order)).toHaveLength(0);
+      expect(await db().select().from(inventoryReservation)).toHaveLength(0);
+
+      const [cartRow] = await db()
+        .select()
+        .from(cart)
+        .where(eq(cart.id, cartId));
+      expect(cartRow.status).toBe("checkout");
+      expect(cartRow.checkoutState).toBe("review");
+    });
+
     it("recovers an already placed COD order from a retired confirmation without duplicating it", async () => {
       const buyer = 94008;
-      const { confirmData, transport: reviewTransport } = await completeReview(buyer);
+      const { confirmData, transport: reviewTransport } =
+        await completeReview(buyer);
       const reviewId = lastScreenMessage(reviewTransport)!.messageId;
       const transport = createFakeTelegramTransport();
       const placed = await call(
@@ -3957,23 +4131,30 @@ describe.skipIf(!shouldRun)("COD managed Telegram journey", () => {
       expect(ordersBefore).toHaveLength(1);
       expect(reservationsBefore).toHaveLength(1);
 
-      await call(
+      const home = await call(
         fixture.connectionAId,
         messageUpdate(buyer, "/start", {}, "en"),
         "bot-secret-a",
         transport,
       );
       const sentBefore = transport.sentMessages.length;
+      const activeBefore = await activeStorefrontRow(buyer);
+      const editedBefore = transport.editedMessages.length;
 
+      const delayedUpdate = callbackUpdate(buyer, confirmData, "en", reviewId);
+      delayedUpdate.update_id = 1;
       const recovered = await call(
         fixture.connectionAId,
-        callbackUpdate(buyer, confirmData, "en", reviewId),
+        delayedUpdate,
         "bot-secret-a",
         transport,
       );
       expect(recovered.status).toBe(200);
-      expect(lastText(recovered.transport)).toContain(reference!);
+      expect(recovered.transport.answeredCallbacks.at(-1)?.text).toContain(
+        reference!,
+      );
       expect(recovered.transport.sentMessages).toHaveLength(sentBefore);
+      expect(recovered.transport.editedMessages).toHaveLength(editedBefore);
       expect(
         recovered.transport.editedMessages.some(
           (entry) => entry.messageId === receiptId,
@@ -3983,9 +4164,26 @@ describe.skipIf(!shouldRun)("COD managed Telegram journey", () => {
       expect(await db().select().from(inventoryReservation)).toEqual(
         reservationsBefore,
       );
-      expect(await activeStorefrontRow(buyer)).toMatchObject({
-        route: "receipt_bridge",
-      });
+      expect(await activeStorefrontRow(buyer)).toEqual(activeBefore);
+
+      const activeMessage = lastScreenMessage(home.transport)!;
+      const currentButton = inlineButtons(activeMessage).find((button) =>
+        button.callback_data?.startsWith("langs:"),
+      );
+      expect(currentButton?.callback_data).toBeDefined();
+      const current = await call(
+        fixture.connectionAId,
+        callbackUpdate(
+          buyer,
+          currentButton!.callback_data!,
+          "en",
+          activeBefore!.activeMessageId,
+        ),
+        "bot-secret-a",
+        transport,
+      );
+      expect(current.status).toBe(200);
+      expect(lastText(current.transport)).toContain("Choose your language");
     });
 
     it("keeps screen identities distinct at and beyond the old 46656 boundary", async () => {
