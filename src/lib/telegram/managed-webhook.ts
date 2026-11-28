@@ -1228,7 +1228,7 @@ async function renderVodafoneOrderState(
             text: copy.languageButton,
             callback_data: tokens.languages(`to:${state.orderId}`),
           },
-          { text: copy.home, callback_data: tokens.homeNew() },
+          { text: copy.home, callback_data: tokens.home() },
         ],
       ],
     },
@@ -2431,9 +2431,9 @@ async function dispatchMessage(
       telegramUserId: buyerId,
     });
 
-    if (activeCart && isCartCommand(text, copy)) {
+    if (isCartCommand(text, copy)) {
       const cart =
-        activeCart.status === "checkout"
+        activeCart?.status === "checkout"
           ? await backToCart(commerceDb, scope, {
               cartId: activeCart.id,
               connectionId,
