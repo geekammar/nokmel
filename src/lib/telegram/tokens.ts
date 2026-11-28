@@ -11,8 +11,13 @@ export const UUID_REGEX =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export const LANG_CODE_REGEX = /^[a-z]{2}$/;
 export const PAGE_REGEX = /^[1-9][0-9]{0,4}$/;
+export const NAVIGATION_TOKEN_REGEX = /^[A-Za-z0-9_-]{12}$/;
 const LANGUAGE_CONTEXT_PATTERN =
-  /^(?:h|cod|p:[1-9][0-9]{0,4}|cs|c:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?::[1-9][0-9]{0,4})?|pd:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|to:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
+  /^(?:h|cod|p:[1-9][0-9]{0,4}|cs|c:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?::[1-9][0-9]{0,4})?|pd:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?::[A-Za-z0-9_-]{12})?|to:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
+
+export function isNavigationToken(value: unknown): value is string {
+  return typeof value === "string" && NAVIGATION_TOKEN_REGEX.test(value);
+}
 
 function assertLanguageContext(context: string | undefined): string | null {
   if (context === undefined) return null;
@@ -172,11 +177,27 @@ export const tokens = {
       page && page > 1 ? `c:${categoryId}:${page}` : `c:${categoryId}`,
     );
   },
-  product: (productId: string): string => {
+  product: (productId: string, navigationToken?: string): string => {
     if (!UUID_REGEX.test(productId)) {
       throw new Error(`Invalid product UUID: "${productId}"`);
     }
-    return assertValidCallbackData(`p:${productId}`);
+    if (navigationToken !== undefined && !isNavigationToken(navigationToken)) {
+      throw new Error(`Invalid navigation token: "${navigationToken}"`);
+    }
+    return assertValidCallbackData(
+      navigationToken ? `p:${productId}:${navigationToken}` : `p:${productId}`,
+    );
+  },
+  productBack: (productId: string, navigationToken?: string): string => {
+    if (!UUID_REGEX.test(productId)) {
+      throw new Error(`Invalid product UUID: "${productId}"`);
+    }
+    if (navigationToken !== undefined && !isNavigationToken(navigationToken)) {
+      throw new Error(`Invalid navigation token: "${navigationToken}"`);
+    }
+    return assertValidCallbackData(
+      navigationToken ? `pb:${productId}:${navigationToken}` : `pb:${productId}`,
+    );
   },
   productInquiry: (productId: string): string => {
     if (!UUID_REGEX.test(productId)) {
@@ -248,7 +269,8 @@ export type ParsedToken =
   | { type: "myInquiries"; page: number }
   | { type: "lang"; code: string; context: string | null }
   | { type: "category"; categoryId: string; page: number }
-  | { type: "product"; productId: string }
+  | { type: "product"; productId: string; navigationToken: string | null }
+  | { type: "productBack"; productId: string; navigationToken: string | null }
   | { type: "productInquiry"; productId: string }
   | { type: "action"; actionId: string }
   | { type: "paymentContact"; actionId: string }
@@ -533,12 +555,42 @@ export function parseToken(data?: string): ParsedToken {
     return { type: "productInquiry", productId };
   }
 
-  if (data.startsWith("p:")) {
-    const productId = data.slice(2);
-    if (!UUID_REGEX.test(productId)) {
-      return { type: "unknown", raw: data };
+  if (data.startsWith("pb:")) {
+    const parts = data.slice(3).split(":");
+    if (parts.length === 1 && UUID_REGEX.test(parts[0])) {
+      return { type: "productBack", productId: parts[0], navigationToken: null };
     }
-    return { type: "product", productId };
+    if (
+      parts.length === 2 &&
+      UUID_REGEX.test(parts[0]) &&
+      isNavigationToken(parts[1])
+    ) {
+      return {
+        type: "productBack",
+        productId: parts[0],
+        navigationToken: parts[1],
+      };
+    }
+    return { type: "unknown", raw: data };
+  }
+
+  if (data.startsWith("p:")) {
+    const parts = data.slice(2).split(":");
+    if (parts.length === 1 && UUID_REGEX.test(parts[0])) {
+      return { type: "product", productId: parts[0], navigationToken: null };
+    }
+    if (
+      parts.length === 2 &&
+      UUID_REGEX.test(parts[0]) &&
+      isNavigationToken(parts[1])
+    ) {
+      return {
+        type: "product",
+        productId: parts[0],
+        navigationToken: parts[1],
+      };
+    }
+    return { type: "unknown", raw: data };
   }
 
   if (data.startsWith("a:")) {

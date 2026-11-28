@@ -9,6 +9,7 @@ import {
 
 describe("telegram tokens", () => {
   const uuid = "123e4567-e89b-12d3-a456-426614174000";
+  const navToken = "AbCdEf123_-x";
 
   it("encodes only the page and validates bounded catalog search callbacks", () => {
     expect(parseToken(tokens.catalogSearch())).toEqual({ type: "catalogSearch" });
@@ -58,6 +59,9 @@ describe("telegram tokens", () => {
     expect(tokens.category(uuid)).toBe(`c:${uuid}`);
     expect(tokens.category(uuid, 2)).toBe(`c:${uuid}:2`);
     expect(tokens.product(uuid)).toBe(`p:${uuid}`);
+    expect(tokens.product(uuid, navToken)).toBe(`p:${uuid}:${navToken}`);
+    expect(tokens.productBack(uuid)).toBe(`pb:${uuid}`);
+    expect(tokens.productBack(uuid, navToken)).toBe(`pb:${uuid}:${navToken}`);
     expect(tokens.productInquiry(uuid)).toBe(`pi:${uuid}`);
     expect(tokens.action(uuid)).toBe(`a:${uuid}`);
     expect(tokens.paymentContact(uuid)).toBe(`pm:${uuid}`);
@@ -79,6 +83,12 @@ describe("telegram tokens", () => {
     expect(tokens.transferList()).toBe("tfl");
     expect(tokens.transferOrder(uuid)).toBe(`tfo:${uuid}`);
     expect(tokens.languages(`to:${uuid}`)).toBe(`langs:to:${uuid}`);
+    expect(tokens.languages(`pd:${uuid}:${navToken}`)).toBe(
+      `langs:pd:${uuid}:${navToken}`,
+    );
+    expect(tokens.lang("en", `pd:${uuid}:${navToken}`)).toBe(
+      `lang:en:pd:${uuid}:${navToken}`,
+    );
 
     // All must be well below 64 bytes
     for (const token of [
@@ -93,6 +103,9 @@ describe("telegram tokens", () => {
       tokens.lang("en"),
       tokens.category(uuid, 99),
       tokens.product(uuid),
+      tokens.product(uuid, navToken),
+      tokens.productBack(uuid),
+      tokens.productBack(uuid, navToken),
       tokens.productInquiry(uuid),
       tokens.action(uuid),
       tokens.paymentContact(uuid),
@@ -113,6 +126,8 @@ describe("telegram tokens", () => {
       tokens.transferList(),
       tokens.transferOrder(uuid),
       tokens.languages(`to:${uuid}`),
+      tokens.languages(`pd:${uuid}:${navToken}`),
+      tokens.lang("en", `pd:${uuid}:${navToken}`),
     ]) {
       expect(Buffer.byteLength(token, "utf8")).toBeLessThanOrEqual(
         TELEGRAM_MAX_CALLBACK_DATA_BYTES,
@@ -127,6 +142,13 @@ describe("telegram tokens", () => {
     expect(() => tokens.category(uuid, 1.5)).toThrow(/Invalid page number/);
 
     expect(() => tokens.product("bad-id")).toThrow(/Invalid product UUID/);
+    expect(() => tokens.product(uuid, "short")).toThrow(
+      /Invalid navigation token/,
+    );
+    expect(() => tokens.productBack("bad-id")).toThrow(/Invalid product UUID/);
+    expect(() => tokens.productBack(uuid, "not a token")).toThrow(
+      /Invalid navigation token/,
+    );
     expect(() => tokens.productInquiry("bad-id")).toThrow(/Invalid product UUID/);
     expect(() => tokens.action("bad-id")).toThrow(/Invalid action UUID/);
     expect(() => tokens.paymentContact("bad-id")).toThrow(/Invalid action UUID/);
@@ -190,6 +212,15 @@ describe("telegram tokens", () => {
       type: "languages",
       context: `to:${uuid}`,
     });
+    expect(parseToken(`langs:pd:${uuid}:${navToken}`)).toEqual({
+      type: "languages",
+      context: `pd:${uuid}:${navToken}`,
+    });
+    expect(parseToken(`lang:ar:pd:${uuid}:${navToken}`)).toEqual({
+      type: "lang",
+      code: "ar",
+      context: `pd:${uuid}:${navToken}`,
+    });
     expect(parseToken("support")).toEqual({ type: "support" });
     expect(parseToken("myinq")).toEqual({ type: "myInquiries", page: 1 });
     expect(parseToken("myinq:2")).toEqual({ type: "myInquiries", page: 2 });
@@ -218,6 +249,22 @@ describe("telegram tokens", () => {
     expect(parseToken(`p:${uuid}`)).toEqual({
       type: "product",
       productId: uuid,
+      navigationToken: null,
+    });
+    expect(parseToken(`p:${uuid}:${navToken}`)).toEqual({
+      type: "product",
+      productId: uuid,
+      navigationToken: navToken,
+    });
+    expect(parseToken(`pb:${uuid}`)).toEqual({
+      type: "productBack",
+      productId: uuid,
+      navigationToken: null,
+    });
+    expect(parseToken(`pb:${uuid}:${navToken}`)).toEqual({
+      type: "productBack",
+      productId: uuid,
+      navigationToken: navToken,
     });
     expect(parseToken(`pi:${uuid}`)).toEqual({
       type: "productInquiry",
@@ -339,6 +386,22 @@ describe("telegram tokens", () => {
 
     // Malformed product, action, back, and language tokens
     expect(parseToken("p:invalid-uuid")).toEqual({ type: "unknown", raw: "p:invalid-uuid" });
+    expect(parseToken(`p:${uuid}:short`)).toEqual({
+      type: "unknown",
+      raw: `p:${uuid}:short`,
+    });
+    expect(parseToken("pb:invalid-uuid")).toEqual({
+      type: "unknown",
+      raw: "pb:invalid-uuid",
+    });
+    expect(parseToken(`pb:${uuid}:short`)).toEqual({
+      type: "unknown",
+      raw: `pb:${uuid}:short`,
+    });
+    expect(parseToken(`langs:pd:${uuid}:short`)).toEqual({
+      type: "unknown",
+      raw: `langs:pd:${uuid}:short`,
+    });
     expect(parseToken("pi:invalid-uuid")).toEqual({ type: "unknown", raw: "pi:invalid-uuid" });
     expect(parseToken("a:invalid-uuid")).toEqual({ type: "unknown", raw: "a:invalid-uuid" });
     expect(parseToken("pm:invalid-uuid")).toEqual({ type: "unknown", raw: "pm:invalid-uuid" });

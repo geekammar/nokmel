@@ -77,7 +77,7 @@ import postgres from "postgres";
 
 const WIZARD = "rabet db:setup:dev";
 
-/** The thirty-eight domain tables created by the committed chain. */
+/** The forty domain tables created by the committed chain. */
 export const EXPECTED_TABLES = [
   "admin_login_throttle",
   "app_user",
@@ -117,6 +117,7 @@ export const EXPECTED_TABLES = [
   "telegram_connection",
   "telegram_link_attempt",
   "telegram_managed_update",
+  "telegram_navigation_context",
   "telegram_update",
 ];
 
@@ -145,6 +146,7 @@ export const EXPECTED_MIGRATION_TAGS = [
   "0020_merchant_notification_bot_managed",
   "0021_merchant_product_publish",
   "0022_merchant_storefront_profile",
+  "0023_telegram_navigation_context",
 ];
 
 const TENANT_TABLES = new Set(["app_user", "store", "store_membership"]);
@@ -175,7 +177,9 @@ const LANGUAGE_PREFERENCE_TABLES = new Set([
 
 /** The thirty-eight-table inventory through 0018 (current baseline before 0019). */
 export const EXPECTED_TABLES_V17 = EXPECTED_TABLES.filter(
-  (t) => t !== "merchant_notification_bot",
+  (t) =>
+    t !== "merchant_notification_bot" &&
+    t !== "telegram_navigation_context",
 );
 
 /** The twenty-one domain tables present in the 0005 tenant-identity baseline. */

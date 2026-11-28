@@ -79,7 +79,19 @@ import {
   buyerLocaleFromLanguageCode,
   isBuyerLocale,
 } from "@/lib/commerce/buyer-language";
-import { tokens, type ParsedToken } from "./tokens";
+import {
+  readNavigationContext,
+  rememberNavigationContext,
+  type NavigationBinding,
+  type NavigationDestination,
+  type NavigationLookup,
+} from "./navigation-context";
+import {
+  isNavigationToken,
+  tokens,
+  UUID_REGEX,
+  type ParsedToken,
+} from "./tokens";
 import { telegramSupportChatUrl } from "./support-contact";
 import {
   classifyErrorToSafeDiagnostic,
@@ -1051,10 +1063,60 @@ async function editOnlyOrThrow(
   }
 }
 
+function logNavigationContextFailure(
+  operation: "read" | "write",
+  error: unknown,
+): void {
+  const diagnostic = classifyErrorToSafeDiagnostic(error);
+  console.error(
+    `[storefront] navigation context ${operation} skipped (${formatSafeDiagnostic(diagnostic)})`,
+  );
+}
+
+/**
+ * Navigation context is optional. A failure to persist it must never hide a
+ * catalog screen that was already read successfully; the screen simply renders
+ * context-free product buttons and direct-entry Back behaviour remains.
+ */
+async function rememberNavigationToken(
+  db: Database,
+  binding: NavigationBinding,
+  destination: NavigationDestination,
+): Promise<string | undefined> {
+  try {
+    return await rememberNavigationContext(db, binding, destination);
+  } catch (error) {
+    logNavigationContextFailure("write", error);
+    return undefined;
+  }
+}
+
+/**
+ * A failed context read is treated like an unusable context. The caller falls
+ * through to the existing safe, localized, store-scoped destination instead of
+ * failing the callback.
+ */
+async function readNavigationLookup(
+  db: Database,
+  binding: NavigationBinding,
+  navigationToken: string,
+): Promise<NavigationLookup | null> {
+  try {
+    return await readNavigationContext(db, binding, navigationToken);
+  } catch (error) {
+    logNavigationContextFailure("read", error);
+    return null;
+  }
+}
+
 function productButton(
   item: { id: string; name: string },
+  navigationToken?: string,
 ): TelegramInlineKeyboardButton {
-  return { text: item.name, callback_data: tokens.product(item.id) };
+  return {
+    text: item.name,
+    callback_data: tokens.product(item.id, navigationToken),
+  };
 }
 
 function categoryButton(
@@ -1127,15 +1189,20 @@ async function renderHome(
   messageId?: number,
   recovery?: HomeRecovery,
   activeMessageHasMedia = false,
+  navigation?: NavigationBinding,
 ): Promise<void> {
   const [page, profile] = await Promise.all([
     listManagedProducts(db, scope, { page: 1, pageSize: PAGE_SIZE }, plan),
     readStorefrontProfile(db, scope),
   ]);
+  const navigationToken =
+    navigation && page.items.length > 0
+      ? await rememberNavigationToken(db, navigation, { route: "home" })
+      : undefined;
 
   const keyboard: TelegramInlineKeyboardButton[][] = [
     [{ text: copy.browseProducts, style: "primary", callback_data: tokens.products(1) }],
-    ...page.items.map((item) => [productButton(item)]),
+    ...page.items.map((item) => [productButton(item, navigationToken)]),
   ];
 
   keyboard.push([
@@ -1213,6 +1280,7 @@ async function renderProducts(
   pageNumber: number,
   copy: CommerceCopy,
   plan: ManagedCatalogContentPlan,
+  navigation?: NavigationBinding,
 ): Promise<void> {
   const page = await listManagedProducts(
     db,
@@ -1223,9 +1291,16 @@ async function renderProducts(
     },
     plan,
   );
+  const navigationToken =
+    navigation && page.items.length > 0
+      ? await rememberNavigationToken(db, navigation, {
+          route: "products",
+          page: page.page,
+        })
+      : undefined;
 
   const keyboard: TelegramInlineKeyboardButton[][] = page.items.map((item) => [
-    productButton(item),
+    productButton(item, navigationToken),
   ]);
 
   if (page.totalPages > 1) {
@@ -1284,19 +1359,30 @@ async function renderCatalogSearch(
   copy: CommerceCopy,
   plan: ManagedCatalogContentPlan,
   messageId?: number,
+  navigation?: NavigationBinding,
 ): Promise<void> {
   const page = await listManagedProducts(
     db, scope, { page: pageNumber, pageSize: PAGE_SIZE, search: query }, plan,
   );
-  const keyboard = page.items.map((item) => [productButton(item)]);
-  const navigation: TelegramInlineKeyboardButton[] = [];
+  const navigationToken =
+    navigation && page.items.length > 0
+      ? await rememberNavigationToken(db, navigation, {
+          route: "search",
+          query,
+          page: page.page,
+        })
+      : undefined;
+  const keyboard = page.items.map((item) => [
+    productButton(item, navigationToken),
+  ]);
+  const pagination: TelegramInlineKeyboardButton[] = [];
   if (page.page > 1) {
-    navigation.push({ text: copy.previous, callback_data: tokens.catalogSearchPage(page.page - 1) });
+    pagination.push({ text: copy.previous, callback_data: tokens.catalogSearchPage(page.page - 1) });
   }
   if (page.page < page.totalPages) {
-    navigation.push({ text: copy.next, callback_data: tokens.catalogSearchPage(page.page + 1) });
+    pagination.push({ text: copy.next, callback_data: tokens.catalogSearchPage(page.page + 1) });
   }
-  if (navigation.length) keyboard.push(navigation);
+  if (pagination.length) keyboard.push(pagination);
   keyboard.push(
     [{ text: copy.search, callback_data: tokens.catalogSearch() }],
     [
@@ -1380,6 +1466,7 @@ async function renderCategory(
   pageNumber: number,
   copy: CommerceCopy,
   plan: ManagedCatalogContentPlan,
+  navigation?: NavigationBinding,
 ): Promise<void> {
   const categoryRow = await readManagedCategory(
     db,
@@ -1421,9 +1508,18 @@ async function renderCategory(
     ),
   ]);
 
+  const navigationToken =
+    navigation && products.items.length > 0
+      ? await rememberNavigationToken(db, navigation, {
+          route: "category",
+          categoryId,
+          page: products.page,
+        })
+      : undefined;
+
   const keyboard: TelegramInlineKeyboardButton[][] = [
     ...children.items.map((item) => [categoryButton(item)]),
-    ...products.items.map((item) => [productButton(item)]),
+    ...products.items.map((item) => [productButton(item, navigationToken)]),
   ];
 
   if (products.totalPages > 1) {
@@ -1548,6 +1644,7 @@ async function renderProduct(
   messageId: number,
   activeMessageHasMedia: boolean,
   productId: string,
+  navigationToken?: string | null,
 ): Promise<void> {
   const productRow = await readManagedProduct(
     db,
@@ -1633,17 +1730,24 @@ async function renderProduct(
     ]);
   }
 
+  const returnToken = isNavigationToken(navigationToken)
+    ? navigationToken
+    : undefined;
+  const productLanguageContext = returnToken
+    ? `pd:${productId}:${returnToken}`
+    : `pd:${productId}`;
+
   keyboard.push([
     {
       text: copy.back,
-      callback_data: tokens.storefrontCategory(productRow.categoryId),
+      callback_data: tokens.productBack(productId, returnToken),
     },
     { text: copy.home, callback_data: tokens.home() },
   ]);
   keyboard.push([
     {
       text: copy.languageButton,
-      callback_data: tokens.languages(`pd:${productId}`),
+      callback_data: tokens.languages(productLanguageContext),
     },
   ]);
 
@@ -1655,6 +1759,192 @@ async function renderProduct(
     productImageUrl(productRow),
     lines.join("\n\n"),
     { inline_keyboard: keyboard },
+  );
+}
+
+async function renderProductBack(
+  db: Database,
+  scope: StoreScope,
+  storeName: string,
+  connectionId: string,
+  cod: CodContext,
+  commerceDb: TransactionDatabase | null,
+  transport: TelegramTransport,
+  chatId: number,
+  messageId: number,
+  activeMessageHasMedia: boolean,
+  buyerId: number,
+  productId: string,
+  navigationToken: string | null,
+  navigation: NavigationBinding,
+  locale: ManagedCommerceLocale,
+  copy: CommerceCopy,
+  plan: ManagedCatalogContentPlan,
+): Promise<void> {
+  const recovery = homeRecoveryFor(
+    commerceDb,
+    connectionId,
+    buyerId,
+    chatId,
+    locale,
+  );
+
+  if (navigationToken) {
+    const lookup = await readNavigationLookup(db, navigation, navigationToken);
+
+    if (!lookup) {
+      await renderHome(
+        db,
+        scope,
+        storeName,
+        cod,
+        copy,
+        plan,
+        transport,
+        chatId,
+        messageId,
+        recovery,
+        activeMessageHasMedia,
+        navigation,
+      );
+      return;
+    }
+
+    if (lookup.status === "found") {
+      const destination = lookup.destination;
+
+      if (destination.route === "home") {
+        await renderHome(
+          db,
+          scope,
+          storeName,
+          cod,
+          copy,
+          plan,
+          transport,
+          chatId,
+          messageId,
+          recovery,
+          activeMessageHasMedia,
+          navigation,
+        );
+        return;
+      }
+
+      if (destination.route === "products") {
+        await renderProducts(
+          db,
+          scope,
+          transport,
+          chatId,
+          messageId,
+          destination.page,
+          copy,
+          plan,
+          navigation,
+        );
+        return;
+      }
+
+      if (destination.route === "categories") {
+        await renderCategories(
+          db,
+          scope,
+          transport,
+          chatId,
+          messageId,
+          destination.page,
+          copy,
+          plan,
+        );
+        return;
+      }
+
+      if (destination.route === "category") {
+        await renderCategory(
+          db,
+          scope,
+          transport,
+          chatId,
+          messageId,
+          destination.categoryId,
+          destination.page,
+          copy,
+          plan,
+          navigation,
+        );
+        return;
+      }
+
+      const query = managedSearchQuery(destination.query);
+      if (query) {
+        await renderCatalogSearch(
+          db,
+          scope,
+          transport,
+          chatId,
+          query,
+          destination.page,
+          copy,
+          plan,
+          messageId,
+          navigation,
+        );
+        return;
+      }
+    }
+
+    if (lookup.status === "expired" || lookup.status === "invalid") {
+      await renderHome(
+        db,
+        scope,
+        storeName,
+        cod,
+        copy,
+        plan,
+        transport,
+        chatId,
+        messageId,
+        recovery,
+        activeMessageHasMedia,
+        navigation,
+      );
+      return;
+    }
+  }
+
+  const productRow = await readManagedProduct(db, scope, productId, plan);
+  if (!productRow) {
+    await renderHome(
+      db,
+      scope,
+      storeName,
+      cod,
+      copy,
+      plan,
+      transport,
+      chatId,
+      messageId,
+      recovery,
+      activeMessageHasMedia,
+      navigation,
+    );
+    return;
+  }
+
+  // Direct entry, a missing context or a context issued for another scope keeps
+  // the existing safe destination: the product's own category in this store.
+  await renderCategory(
+    db,
+    scope,
+    transport,
+    chatId,
+    messageId,
+    productRow.categoryId,
+    1,
+    copy,
+    plan,
+    navigation,
   );
 }
 
@@ -1682,6 +1972,15 @@ async function dispatchMessage(
 ): Promise<void> {
   const text = typeof message.text === "string" ? message.text.trim() : "";
   const buyerId = message.from?.id ?? null;
+  const navigation = buyerId === null
+    ? undefined
+    : {
+        storeId: scope.storeId,
+        connectionId,
+        botId,
+        telegramUserId: buyerId,
+        telegramChatId: message.chat.id,
+      };
   const context = await languageContextFor(
     db,
     scope,
@@ -1708,6 +2007,8 @@ async function dispatchMessage(
         message.chat.id,
         context.language.locale,
       ),
+      false,
+      navigation,
     );
     return;
   }
@@ -1745,7 +2046,18 @@ async function dispatchMessage(
       reply.chat?.id === message.chat.id && matchesSearchPrompt(reply.text)) {
     const query = managedSearchQuery(text);
     if (query) {
-      await renderCatalogSearch(db, scope, transport, message.chat.id, query, 1, copy, plan);
+      await renderCatalogSearch(
+        db,
+        scope,
+        transport,
+        message.chat.id,
+        query,
+        1,
+        copy,
+        plan,
+        undefined,
+        navigation,
+      );
     } else {
       await sendCatalogSearchPrompt(transport, message.chat.id, copy, true);
     }
@@ -2008,6 +2320,8 @@ async function dispatchMessage(
       message.chat.id,
       context.language.locale,
     ),
+    false,
+    navigation,
   );
 }
 
@@ -2023,6 +2337,7 @@ async function renderAfterLanguageChange(
   messageId: number,
   buyerId: number,
   context: LanguageContext,
+  navigation: NavigationBinding,
 ): Promise<void> {
   const { copy, plan } = context;
 
@@ -2105,6 +2420,8 @@ async function renderAfterLanguageChange(
       chatId,
       context.language.locale,
     ),
+    false,
+    navigation,
   );
 }
 
@@ -2118,6 +2435,7 @@ async function renderLanguageContextScreen(
   transport: TelegramTransport,
   chatId: number,
   messageId: number,
+  navigation: NavigationBinding,
   context: string | null,
   recovery?: HomeRecovery,
   activeMessageHasMedia = false,
@@ -2136,6 +2454,7 @@ async function renderLanguageContextScreen(
       messageId,
       recovery,
       activeMessageHasMedia,
+      navigation,
     );
     return true;
   }
@@ -2198,6 +2517,7 @@ async function renderLanguageContextScreen(
         page,
         copy,
         plan,
+        navigation,
       );
       return true;
     }
@@ -2205,6 +2525,11 @@ async function renderLanguageContextScreen(
   }
 
   if (context.startsWith("pd:")) {
+    const [productId, navigationToken, ...rest] = context.slice(3).split(":");
+    if (!UUID_REGEX.test(productId) || rest.length > 0) return false;
+    if (navigationToken !== undefined && !isNavigationToken(navigationToken)) {
+      return false;
+    }
     await renderProduct(
       db,
       scope,
@@ -2215,7 +2540,8 @@ async function renderLanguageContextScreen(
       chatId,
       messageId,
       activeMessageHasMedia,
-      context.slice(3),
+      productId,
+      navigationToken,
     );
     return true;
   }
@@ -2234,6 +2560,7 @@ async function renderLanguageContextScreen(
         page,
         copy,
         plan,
+        navigation,
       );
       return true;
     }
@@ -2273,6 +2600,13 @@ async function dispatchCallback(
   const messageId = message.message_id;
   const activeMessageHasMedia = messageHasPhoto(message);
   const buyerId = callbackQuery.from.id;
+  const navigation: NavigationBinding = {
+    storeId: scope.storeId,
+    connectionId,
+    botId: updateAttempt.botId,
+    telegramUserId: buyerId,
+    telegramChatId: chatId,
+  };
   let context = await languageContextFor(
     db,
     scope,
@@ -2290,7 +2624,16 @@ async function dispatchCallback(
     const query = queryFromSearchResults(message, updateAttempt.botId);
     if (query) {
       await renderCatalogSearch(
-        db, scope, transport, chatId, query, parsedToken.page, copy, plan, messageId,
+        db,
+        scope,
+        transport,
+        chatId,
+        query,
+        parsedToken.page,
+        copy,
+        plan,
+        messageId,
+        navigation,
       );
     }
     return;
@@ -2369,6 +2712,7 @@ async function dispatchCallback(
         transport,
         chatId,
         messageId,
+        navigation,
         parsedToken.context,
         homeRecoveryFor(
           commerceDb,
@@ -2395,6 +2739,7 @@ async function dispatchCallback(
       messageId,
       buyerId,
       context,
+      navigation,
     );
     return;
   }
@@ -2987,6 +3332,8 @@ async function dispatchCallback(
         chatId,
         context.language.locale,
       ),
+      false,
+      navigation,
     );
     return;
   }
@@ -3010,6 +3357,7 @@ async function dispatchCallback(
         context.language.locale,
       ),
       activeMessageHasMedia,
+      navigation,
     );
     return;
   }
@@ -3024,6 +3372,7 @@ async function dispatchCallback(
       parsedToken.page,
       copy,
       plan,
+      navigation,
     );
     return;
   }
@@ -3053,6 +3402,30 @@ async function dispatchCallback(
       parsedToken.page,
       copy,
       plan,
+      navigation,
+    );
+    return;
+  }
+
+  if (parsedToken.type === "productBack") {
+    await renderProductBack(
+      db,
+      scope,
+      storeName,
+      connectionId,
+      cod,
+      commerceDb,
+      transport,
+      chatId,
+      messageId,
+      activeMessageHasMedia,
+      buyerId,
+      parsedToken.productId,
+      parsedToken.navigationToken,
+      navigation,
+      context.language.locale,
+      copy,
+      plan,
     );
     return;
   }
@@ -3069,6 +3442,7 @@ async function dispatchCallback(
       messageId,
       activeMessageHasMedia,
       parsedToken.productId,
+      parsedToken.navigationToken,
     );
     return;
   }
@@ -3086,6 +3460,8 @@ async function dispatchCallback(
     chatId,
     messageId,
     homeRecoveryFor(commerceDb, connectionId, buyerId, chatId, context.language.locale),
+    false,
+    navigation,
   );
 }
 
