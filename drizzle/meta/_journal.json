@@ -162,6 +162,13 @@
       "when": 1795867633087,
       "tag": "0022_merchant_storefront_profile",
       "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1795871371555,
+      "tag": "0023_telegram_navigation_context",
+      "breakpoints": true
     }
   ]
 }
