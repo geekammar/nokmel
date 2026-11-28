@@ -4038,6 +4038,33 @@ describe.skipIf(!shouldRun)("COD managed Telegram journey", () => {
           route: "products",
         });
       }
+
+      // A very old revision-1 token must not collide with revision 46657.
+      await db()
+        .update(telegramActiveStorefront)
+        .set({ revision: 46_657, route: "home", inputMode: "none" })
+        .where(key);
+      const ancientTransport = createFakeTelegramTransport();
+      const ancient = await call(
+        fixture.connectionAId,
+        callbackUpdate(
+          buyer,
+          withScreenRevision(tokens.products(), 1),
+          "en",
+          home.messageId,
+        ),
+        "bot-secret-a",
+        ancientTransport,
+      );
+      expect(ancient.status).toBe(200);
+      expect(ancient.transport.answeredCallbacks.at(-1)?.text).toContain(
+        "no longer active",
+      );
+      expect(ancient.transport.editedMessages).toHaveLength(0);
+      expect(await activeStorefrontRow(buyer)).toMatchObject({
+        revision: 46_657,
+        route: "home",
+      });
     });
 
 });
